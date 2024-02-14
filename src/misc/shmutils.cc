@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "shm.h"
+#include "comm.h"
 #include "checks.h"
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -32,7 +33,7 @@ static void shmHandleInit(int fd, char* shmPath, size_t shmSize, size_t realShmS
   handle->devShmPtr = dptr;
   handle->shmSize = shmSize;
   handle->realShmSize = realShmSize;
-  handle->refcount = (int*)(hptr + shmSize);
+  handle->refcount = (hptr != NULL) ? (int*)(hptr + shmSize) : NULL;
   if (create) {
     int slen = strlen(shmPath);
     handle->shmPath = (char*)malloc(slen + 1);
@@ -67,7 +68,7 @@ ncclResult_t ncclShmOpen(char* shmPath, size_t shmSize, void** shmPtr, void** de
       SYSCHECKGOTO(fd = open(shmPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR), ret, fail);
     }
 
-    if (ftruncate(fd, realShmSize) != 0) {
+    if (fallocate(fd, 0, 0, realShmSize) != 0) {
       WARN("Error: failed to extend %s to %ld bytes", shmPath, realShmSize);
       ret = ncclSystemError;
       goto fail;
@@ -81,6 +82,7 @@ ncclResult_t ncclShmOpen(char* shmPath, size_t shmSize, void** shmPtr, void** de
   if (hptr == MAP_FAILED) {
     WARN("Could not map %s size %zi, error: %s", shmPath, realShmSize, strerror(errno));
     ret = ncclSystemError;
+    hptr = NULL;
     goto fail;
   }
 
@@ -125,7 +127,7 @@ ncclResult_t ncclShmClose(ncclShmHandle_t handle) {
   if (tmphandle) {
     if (tmphandle->fd >= 0) {
       close(tmphandle->fd);
-      if (tmphandle->shmPath != NULL && *tmphandle->refcount > 0) {
+      if (tmphandle->shmPath != NULL && tmphandle->refcount != NULL && *tmphandle->refcount > 0) {
         if (unlink(tmphandle->shmPath) != 0) {
           WARN("unlink shared memory %s failed, error: %s", tmphandle->shmPath, strerror(errno));
           ret = ncclSystemError;
@@ -159,5 +161,39 @@ ncclResult_t ncclShmUnlink(ncclShmHandle_t handle) {
       tmphandle->shmPath = NULL;
     }
   }
+  return ret;
+}
+
+ncclResult_t ncclShmemAllgather(struct ncclComm *comm, struct ncclShmemCollBuff *shmem, void *sendbuff, void *recvbuff, size_t typeSize) {
+  ncclResult_t ret = ncclSuccess;
+  int curRound = shmem->round;
+  size_t mycnt;
+
+  if (comm == NULL || shmem == NULL || sendbuff == NULL || recvbuff == NULL || shmem->maxTypeSize < typeSize) {
+    ret = ncclInvalidArgument;
+    goto exit;
+  }
+
+  memcpy((char*)shmem->ptr[curRound] + comm->localRank * typeSize, sendbuff, typeSize);
+  /* sync among local ranks */
+  mycnt = __atomic_add_fetch(shmem->cnt[curRound], 1, __ATOMIC_ACQ_REL);
+  if (mycnt == comm->localRanks) {
+    *shmem->cnt[curRound ^ 1] = 0; /* prepare next round */
+    __atomic_store_n(shmem->cnt[curRound], comm->localRanks + 1, __ATOMIC_RELEASE); /* release everyone */
+  } else {
+    uint64_t t0 = clockNano();
+    while(__atomic_load_n(shmem->cnt[curRound], __ATOMIC_ACQUIRE) != comm->localRanks + 1) {
+      if (clockNano() - t0 >= 5 * 1000) sched_yield();
+      if (__atomic_load_n(comm->abortFlag, __ATOMIC_RELAXED) == 1) {
+        ret = ncclInternalError;
+        goto exit;
+      }
+    }
+  }
+
+  memcpy(recvbuff, (const void*)shmem->ptr[curRound], comm->localRanks * typeSize);
+  shmem->round ^= 1;
+
+exit:
   return ret;
 }
