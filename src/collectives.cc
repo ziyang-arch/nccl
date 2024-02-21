@@ -79,7 +79,7 @@ ncclResult_t ncclBcast(void* buff, size_t count, ncclDataType_t datatype, int ro
 
 NCCL_API(ncclResult_t, ncclReduce, const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream);
-ncclResult_t ncclReduce(const void* sendbuff, void* recvbuff, size_t count,
+ncclResult_t    ncclReduce(const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
   struct NvtxParamsReduce {
     size_t bytes;

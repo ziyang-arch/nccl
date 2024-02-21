@@ -9,6 +9,13 @@
 
 #include "nccl.h"
 
+//#define ORIGINAL_NVMLWRAP
+#define OVERWRITE_NVMLWRAP
+
+
+//original nvmlwrap
+#ifdef ORIGINAL_NVMLWRAP
+
 //#define NCCL_NVML_DIRECT 1
 #ifndef NCCL_NVML_DIRECT
 #define NCCL_NVML_DIRECT 0
@@ -17,10 +24,11 @@
 #if NCCL_NVML_DIRECT
 #include "nvml.h"
 #else
+
 // Dynamically handle dependencies on NVML
 
 /* Extracted from nvml.h */
-
+#define NVML_API_VERSION
 #define NVML_API_VERSION            12
 
 #define NVML_STRUCT_VERSION(data, ver) (unsigned int)(sizeof(nvml ## data ## _v ## ver ## _t) | \
@@ -47,6 +55,8 @@ typedef enum nvmlNvLinkCapability_enum
     NVML_NVLINK_CAP_COUNT
 } nvmlNvLinkCapability_t;
 
+
+//same
 typedef enum nvmlReturn_enum
 {
     NVML_SUCCESS = 0,                   //!< The operation was successful
@@ -72,6 +82,8 @@ typedef enum nvmlReturn_enum
     NVML_ERROR_UNKNOWN = 999            //!< An internal driver error occurred
 } nvmlReturn_t;
 
+
+//different in busId and reserved*
 typedef struct nvmlPciInfo_st
 {
     char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE]; //!< The tuple domain:bus:device.function PCI identifier (&amp; NULL terminator)
@@ -90,6 +102,8 @@ typedef struct nvmlPciInfo_st
     unsigned int reserved3;
 } nvmlPciInfo_t;
 
+
+//same
 /* P2P Capability Index Status*/
 typedef enum nvmlGpuP2PStatus_enum
 {
@@ -113,6 +127,9 @@ typedef enum nvmlGpuP2PCapsIndex_enum
     NVML_P2P_CAPS_INDEX_UNKNOWN
 } nvmlGpuP2PCapsIndex_t;
 
+
+
+//same
 /**
  * Represents the type for sample value returned
  */
@@ -128,7 +145,7 @@ typedef enum nvmlValueType_enum
     NVML_VALUE_TYPE_COUNT
 }nvmlValueType_t;
 
-
+//same
 /**
  * Union to represent different types of Value
  */
@@ -173,6 +190,8 @@ typedef union nvmlValue_st
 
 #define NVML_FI_MAX 173 //!< One greater than the largest field ID defined above
 
+
+//same
 /**
  * Information for a Field Value Sample
  */
@@ -204,6 +223,8 @@ typedef struct {
     nvmlGpuFabricState_t state;                                 //!< Current state of GPU registration process
 } nvmlGpuFabricInfo_t;
 
+
+//not in nvml.h
 #define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_NOT_SUPPORTED 0
 #define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_TRUE          1
 #define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_FALSE         2
@@ -255,6 +276,231 @@ typedef nvmlGpuFabricInfo_v2_t nvmlGpuFabricInfoV_t;
 
 /* End of nvml.h */
 #endif // NCCL_NVML_DIRECT
+
+
+#endif //ORIGINAL_NVMLWRAP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#ifdef OVERWRITE_NVMLWRAP
+
+//#define NCCL_NVML_DIRECT 1
+#ifndef NCCL_NVML_DIRECT
+#define NCCL_NVML_DIRECT 0
+#endif
+
+
+#include "nvml.h"
+
+
+
+/* 
+the macro not included in nvml.h
+*/
+
+#define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_NOT_SUPPORTED 0
+#define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_TRUE          1
+#define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_FALSE         2
+
+#define NVML_GPU_FABRIC_HEALTH_MASK_SHIFT_DEGRADED_BW 0
+#define NVML_GPU_FABRIC_HEALTH_MASK_WIDTH_DEGRADED_BW 0x11
+
+
+
+
+/*
+different macro
+*/
+
+#ifdef NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE
+#define NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE   16
+#endif
+
+/*
+conflicting type
+*/
+
+/**
+ * Union to represent different types of Value
+
+typedef union nvmlValue_st
+{
+    double dVal;                    //!< If the value is double
+    unsigned int uiVal;             //!< If the value is unsigned int
+    unsigned long ulVal;            //!< If the value is unsigned long
+    unsigned long long ullVal;      //!< If the value is unsigned long long
+    signed long long sllVal;        //!< If the value is signed long long
+}nvmlValue_t;
+
+
+typedef enum nvmlValueType_enum
+{
+    NVML_VALUE_TYPE_DOUBLE = 0,
+    NVML_VALUE_TYPE_UNSIGNED_INT = 1,
+    NVML_VALUE_TYPE_UNSIGNED_LONG = 2,
+    NVML_VALUE_TYPE_UNSIGNED_LONG_LONG = 3,
+    NVML_VALUE_TYPE_SIGNED_LONG_LONG = 4,
+
+    // Keep this last
+    NVML_VALUE_TYPE_COUNT
+}nvmlValueType_t;
+
+
+typedef enum nvmlGpuP2PStatus_enum
+{
+    NVML_P2P_STATUS_OK     = 0,
+    NVML_P2P_STATUS_CHIPSET_NOT_SUPPORED,
+    NVML_P2P_STATUS_GPU_NOT_SUPPORTED,
+    NVML_P2P_STATUS_IOH_TOPOLOGY_NOT_SUPPORTED,
+    NVML_P2P_STATUS_DISABLED_BY_REGKEY,
+    NVML_P2P_STATUS_NOT_SUPPORTED,
+    NVML_P2P_STATUS_UNKNOWN
+} nvmlGpuP2PStatus_t;
+
+
+typedef struct nvmlPciInfo_st
+{
+    char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE]; //!< The tuple domain:bus:device.function PCI identifier (&amp; NULL terminator)
+    unsigned int domain;             //!< The PCI domain on which the device's bus resides, 0 to 0xffff
+    unsigned int bus;                //!< The bus on which the device resides, 0 to 0xff
+    unsigned int device;             //!< The device's id on the bus, 0 to 31
+    unsigned int pciDeviceId;        //!< The combined 16-bit device id and 16-bit vendor id
+
+    // Added in NVML 2.285 API
+    unsigned int pciSubSystemId;     //!< The 32-bit Sub System Device ID
+
+    // NVIDIA reserved for internal use only
+    unsigned int reserved0;
+    unsigned int reserved1;
+    unsigned int reserved2;
+    unsigned int reserved3;
+} nvmlPciInfo_t;
+
+ */
+
+//************************************
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * Field Identifiers.
+ *
+ * All Identifiers pertain to a device. Each ID is only used once and is guaranteed never to change.
+ */
+
+/* NVLink Speed */
+#define NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON 90  //!< Common NVLink Speed in MBps for active links
+#define NVML_FI_DEV_NVLINK_LINK_COUNT        91  //!< Number of NVLinks present on the device
+
+/**
+ * Remote device NVLink ID
+ *
+ * Link ID needs to be specified in the scopeId field in nvmlFieldValue_t.
+ */
+#define NVML_FI_DEV_NVLINK_REMOTE_NVLINK_ID     146 //!< Remote device NVLink ID
+
+/**
+ * NVSwitch: connected NVLink count
+ */
+#define NVML_FI_DEV_NVSWITCH_CONNECTED_LINK_COUNT   147  //!< Number of NVLinks connected to NVSwitch
+
+#define NVML_FI_DEV_NVLINK_GET_SPEED                  164
+#define NVML_FI_DEV_NVLINK_GET_STATE                  165
+#define NVML_FI_DEV_NVLINK_GET_VERSION                166
+
+#define NVML_FI_DEV_C2C_LINK_COUNT                    170 //!< Number of C2C Links present on the device
+#define NVML_FI_DEV_C2C_LINK_GET_STATUS               171 //!< C2C Link Status 0=INACTIVE 1=ACTIVE
+#define NVML_FI_DEV_C2C_LINK_GET_MAX_BW               172 //!< C2C Link Speed in MBps for active links
+
+#define NVML_FI_MAX 173 //!< One greater than the largest field ID defined above
+
+
+
+
+#define NVML_GPU_FABRIC_UUID_LEN 16
+
+#define NVML_GPU_FABRIC_STATE_NOT_SUPPORTED 0
+#define NVML_GPU_FABRIC_STATE_NOT_STARTED   1
+#define NVML_GPU_FABRIC_STATE_IN_PROGRESS   2
+#define NVML_GPU_FABRIC_STATE_COMPLETED     3
+
+typedef unsigned char nvmlGpuFabricState_t;
+
+
+
+#define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_NOT_SUPPORTED 0
+#define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_TRUE          1
+#define NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_FALSE         2
+
+#define NVML_GPU_FABRIC_HEALTH_MASK_SHIFT_DEGRADED_BW 0
+#define NVML_GPU_FABRIC_HEALTH_MASK_WIDTH_DEGRADED_BW 0x11
+
+/**
+ * GPU Fabric Health Status Mask for various fields can be obtained
+ * using the below macro.
+ * Ex - NVML_GPU_FABRIC_HEALTH_GET(var, _DEGRADED_BW)
+ */
+#define NVML_GPU_FABRIC_HEALTH_GET(var, type)             \
+    (((var) >> NVML_GPU_FABRIC_HEALTH_MASK_SHIFT##type) & \
+     (NVML_GPU_FABRIC_HEALTH_MASK_WIDTH##type))
+
+/**
+ * GPU Fabric Health Status Mask for various fields can be tested
+ * using the below macro.
+ * Ex - NVML_GPU_FABRIC_HEALTH_TEST(var, _DEGRADED_BW, _TRUE)
+ */
+#define NVML_GPU_FABRIC_HEALTH_TEST(var, type, val) \
+    (NVML_GPU_FABRIC_HEALTH_GET(var, type) ==       \
+     NVML_GPU_FABRIC_HEALTH_MASK##type##val)
+
+/**
+* GPU Fabric information (v2).
+*
+* Version 2 adds the \ref nvmlGpuFabricInfo_v2_t.version field
+* to the start of the structure, and the \ref nvmlGpuFabricInfo_v2_t.healthMask
+* field to the end. This structure is not backwards-compatible with
+* \ref nvmlGpuFabricInfo_t.
+*/
+typedef struct {
+    unsigned int         version;                               //!< Structure version identifier (set to \ref nvmlGpuFabricInfo_v2)
+    unsigned char        clusterUuid[NVML_GPU_FABRIC_UUID_LEN]; //!< Uuid of the cluster to which this GPU belongs
+    nvmlReturn_t         status;                                //!< Error status, if any. Must be checked only if state returns "complete".
+    unsigned int         cliqueId;                              //!< ID of the fabric clique to which this GPU belongs
+    nvmlGpuFabricState_t state;                                 //!< Current state of GPU registration process
+    unsigned int         healthMask;                            //!< GPU Fabric health Status Mask
+} nvmlGpuFabricInfo_v2_t;
+
+typedef nvmlGpuFabricInfo_v2_t nvmlGpuFabricInfoV_t;
+
+/**
+* Version identifier value for \ref nvmlGpuFabricInfo_v2_t.version.
+*/
+#define nvmlGpuFabricInfo_v2 NVML_STRUCT_VERSION(GpuFabricInfo, 2)
+
+
+
+#endif // End of OVERWRITE_NVMLWRAP
+
+
 
 constexpr int ncclNvmlMaxDevices = 32;
 struct ncclNvmlDeviceInfo {

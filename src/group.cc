@@ -11,6 +11,21 @@
 #include "channel.h"
 #include <assert.h>
 
+
+
+#define POWERTUNING_TURING
+#ifdef POWERTUNING_TURING
+/*
+For tuning the frequency when running collectives 
+and combine the nvml command into these 
+*/
+
+#include "nvmlwrap.h"
+
+
+#endif 
+
+
 __thread int ncclGroupDepth = 0; // depth of ncclGroupStart nesting
 __thread ncclResult_t ncclGroupError = ncclSuccess;
 __thread struct ncclComm* ncclGroupCommHead = nullptr;
@@ -120,6 +135,30 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
   // This outer loop iterates over cliques of comms which are siblings of the
   // same global entity. We calculate a clique as all comms which have the same
   // `intraComm0` value.
+
+/*
+nvml initialization
+*/
+#ifdef POWERTUNING_TURING
+
+nvmlReturn_t nvml_result;
+nvmlDevice_t device;
+unsigned int device_count, i, setFreq;
+int gpuIndex;
+    nvml_result = nvmlInit_v2();
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+        goto Error;
+    }
+
+    nvml_result = nvmlDeviceGetCount(&device_count);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
+        goto Error;
+    }
+#endif 
+
+
   do {
     struct ncclComm* comm = cliqueHead;
     bool capturingYes = false, capturingNo = false;
@@ -140,6 +179,34 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
       result = ncclInvalidUsage;
       goto failure;
     }
+
+ 
+#ifdef POWERTUNING_TURING
+/*
+set the sm frequency to a given value
+*/
+
+setFreq=1095;
+
+    for (i = 0; i < device_count; i++) {
+      if (gpuIndex == -1 || gpuIndex == i) {
+        nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            goto Error;
+        }
+
+        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            goto Error;
+        }
+      }
+    }
+
+#endif
+
+
 
     while (true) { // Iterate rounds of launches for clique.
       bool moreRounds;
@@ -176,6 +243,27 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
     }
     cliqueHead = cliqueNextHead;
   } while (cliqueHead != nullptr);
+
+#ifdef POWERTUNING_TURING
+/*
+restore frequency and error print
+
+*/
+ 
+nvml_result=nvmlDeviceResetGpuLockedClocks(device);
+if (NVML_SUCCESS != nvml_result) {
+    printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+    goto Error;
+}
+
+Error:
+    nvml_result = nvmlShutdown();
+    if (NVML_SUCCESS != nvml_result)
+        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+
+#endif
+
+
 failure:
   return result;
 }
