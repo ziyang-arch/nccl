@@ -34,6 +34,11 @@ ifeq ($(CUDARTLIB), cudart_static)
 	LIBSRCFILES += enhcompat.cc
 endif
 
+##### include NVML 
+NVML_LIB += $(CUDA_HOME)/lib/
+NVML_LIB_L := $(addprefix -L , $(NVML_LIB))
+
+
 INCTARGETS := $(INCEXPORTS:%=$(INCDIR)/%)
 LIBSONAME  := $(LIBNAME:%=%.$(NCCL_MAJOR))
 LIBTARGET  := $(LIBNAME:%=%.$(NCCL_MAJOR).$(NCCL_MINOR).$(NCCL_PATCH))
@@ -41,7 +46,7 @@ STATICLIBTARGET := $(STATICLIBNAME)
 PKGTARGET  := $(PKGCONFIGFILE)
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEPFILES   := $(LIBOBJ:%.o=%.d)
-LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl
+LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl -lnvidia-ml $(NVML_LIB_L) -lm
 
 DEVMANIFEST := $(BUILDDIR)/obj/device/manifest
 

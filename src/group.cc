@@ -158,6 +158,30 @@ int gpuIndex;
     }
 #endif 
 
+#ifdef POWERTUNING_TURING
+/*
+set the sm frequency to a given value
+*/
+
+setFreq=1095;
+
+    for (i = 0; i < device_count; i++) {
+      if (gpuIndex == -1 || gpuIndex == i) { 
+        nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            goto Error;
+        }
+
+        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            goto Error;
+        }
+      }
+    }
+
+#endif
 
   do {
     struct ncclComm* comm = cliqueHead;
@@ -181,30 +205,7 @@ int gpuIndex;
     }
 
  
-#ifdef POWERTUNING_TURING
-/*
-set the sm frequency to a given value
-*/
 
-setFreq=1095;
-
-    for (i = 0; i < device_count; i++) {
-      if (gpuIndex == -1 || gpuIndex == i) {
-        nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            goto Error;
-        }
-
-        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            goto Error;
-        }
-      }
-    }
-
-#endif
 
 
 
@@ -247,9 +248,8 @@ setFreq=1095;
 #ifdef POWERTUNING_TURING
 /*
 restore frequency and error print
-
 */
- 
+
 nvml_result=nvmlDeviceResetGpuLockedClocks(device);
 if (NVML_SUCCESS != nvml_result) {
     printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
