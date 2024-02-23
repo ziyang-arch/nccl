@@ -207,8 +207,6 @@ setFreq=1095;
  
 
 
-
-
     while (true) { // Iterate rounds of launches for clique.
       bool moreRounds;
       comm = cliqueHead;
