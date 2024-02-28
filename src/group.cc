@@ -11,7 +11,14 @@
 #include "channel.h"
 #include <assert.h>
 
+//#define PROFILE
+#ifdef PROFILE
+#include <iostream>
+#include <libkineto.h>
+//using namespace kineto;
+static const std::string kFileName = "./nccl_groupLaunch_trace.json";
 
+#endif
 
 #define POWERTUNING_TURING
 #ifdef POWERTUNING_TURING
@@ -19,10 +26,10 @@
 For tuning the frequency when running collectives 
 and combine the nvml command into these 
 */
-
 #include "nvmlwrap.h"
-
-
+extern bool nvml_on;
+extern nvmlReturn_t nvml_result;
+extern nvmlDevice_t device;
 #endif 
 
 
@@ -99,6 +106,43 @@ ncclResult_t ncclGroupStart() {
   NVTX3_FUNC_RANGE_IN(nccl_domain);
 
   NCCLCHECK(ncclGroupStartInternal());
+  
+#ifdef PROFILE
+
+// Empty types set defaults to all types
+  std::set<libkineto::ActivityType> types;
+  libkineto_init(false, true);
+  libkineto::api().initProfilerIfRegistered();
+
+  auto& profiler = libkineto::api().activityProfiler();
+  profiler.prepareTrace(types);
+// Good to warm up after prepareTrace to get cupti initialization to settle
+  profiler.startTrace();
+#endif
+
+/*
+nvml initialization
+*/
+#ifdef POWERTUNING_TURING
+
+    if(!nvml_on){
+      nvml_result = nvmlInit_v2();
+      if (NVML_SUCCESS != nvml_result) {
+          printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+          //goto Error;
+      }
+      nvml_on=true;
+    }
+    
+    /*
+    nvml_result = nvmlDeviceGetCount(&device_count);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
+        goto Error;
+    }
+    */
+#endif 
+
   TRACE_CALL("ncclGroupStart()");
   return ret;
 }
@@ -136,52 +180,7 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
   // same global entity. We calculate a clique as all comms which have the same
   // `intraComm0` value.
 
-/*
-nvml initialization
-*/
-#ifdef POWERTUNING_TURING
 
-nvmlReturn_t nvml_result;
-nvmlDevice_t device;
-unsigned int device_count, i, setFreq;
-int gpuIndex;
-    nvml_result = nvmlInit_v2();
-    if (NVML_SUCCESS != nvml_result) {
-        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
-        goto Error;
-    }
-
-    nvml_result = nvmlDeviceGetCount(&device_count);
-    if (NVML_SUCCESS != nvml_result) {
-        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
-        goto Error;
-    }
-#endif 
-
-#ifdef POWERTUNING_TURING
-/*
-set the sm frequency to a given value
-*/
-
-setFreq=1095;
-
-    for (i = 0; i < device_count; i++) {
-      if (gpuIndex == -1 || gpuIndex == i) { 
-        nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            goto Error;
-        }
-
-        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            goto Error;
-        }
-      }
-    }
-
-#endif
 
   do {
     struct ncclComm* comm = cliqueHead;
@@ -243,23 +242,6 @@ setFreq=1095;
     cliqueHead = cliqueNextHead;
   } while (cliqueHead != nullptr);
 
-#ifdef POWERTUNING_TURING
-/*
-restore frequency and error print
-*/
-
-nvml_result=nvmlDeviceResetGpuLockedClocks(device);
-if (NVML_SUCCESS != nvml_result) {
-    printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-    goto Error;
-}
-
-Error:
-    nvml_result = nvmlShutdown();
-    if (NVML_SUCCESS != nvml_result)
-        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
-
-#endif
 
 
 failure:
@@ -500,6 +482,7 @@ ncclResult_t ncclGroupEndInternal() {
       SYSCHECKGOTO(pthread_create(&ncclGroupJobMainPtr->base.thread, NULL, ncclAsyncJobMain, (void*)&ncclGroupJobMainPtr->base), ret, fail);
       ret = ncclInProgress;
     } else {
+
       /* blocking group */
       NCCLCHECKGOTO(groupLaunch(&ncclGroupJobMainPtr->base), ret, fail);
       groupResetJobState(ncclGroupJobMainPtr);

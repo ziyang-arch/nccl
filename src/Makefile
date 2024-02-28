@@ -34,10 +34,17 @@ ifeq ($(CUDARTLIB), cudart_static)
 	LIBSRCFILES += enhcompat.cc
 endif
 
+
+
 ##### include NVML 
 NVML_LIB += $(CUDA_HOME)/lib/
 NVML_LIB_L := $(addprefix -L , $(NVML_LIB))
 
+#### include  kineto
+KINETO_INC = /data3/zjia016/kineto/libkineto/include
+KINETO_LIB = /data3/zjia016/kineto/libkineto/build
+fmt_INC = /data3/zjia016/kineto/libkineto/third_party/fmt/include
+fmt_LIB = /data3/zjia016/kineto/libkineto/build/fmt
 
 INCTARGETS := $(INCEXPORTS:%=$(INCDIR)/%)
 LIBSONAME  := $(LIBNAME:%=%.$(NCCL_MAJOR))
@@ -46,7 +53,10 @@ STATICLIBTARGET := $(STATICLIBNAME)
 PKGTARGET  := $(PKGCONFIGFILE)
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEPFILES   := $(LIBOBJ:%.o=%.d)
-LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl -lnvidia-ml $(NVML_LIB_L) -lm
+LDFLAGS    +=  -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl -lnvidia-ml $(NVML_LIB_L) -lm  
+
+CXXFLAGS   +=  -std=c++14 -I${KINETO_INC} -I${fmt_INC}  -L${KINETO_LIB} -L${fmt_LIB} -D POWERTUNING_TURING #-D PROFILE # # define POWERTUNING_TURING for code in group.cc
+
 
 DEVMANIFEST := $(BUILDDIR)/obj/device/manifest
 

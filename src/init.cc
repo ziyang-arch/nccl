@@ -36,6 +36,24 @@
 #define NCCL_GROUP_CUDA_STREAM 1 // CGMD: CUDA 9.0,9.1 Need to use an internal CUDA stream
 #endif
 
+
+#define POWERTUNING_TURING
+#ifdef POWERTUNING_TURING
+/*
+For tuning the frequency when running collectives 
+and combine the nvml command into these 
+*/
+#include "nvmlwrap.h"
+
+bool nvml_on=false;
+nvmlReturn_t nvml_result;
+nvmlDevice_t device;
+unsigned int device_count, i, setFreq;
+int gpuIndex;
+
+#endif 
+
+
 const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
 const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree" };
 const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
@@ -1736,6 +1754,42 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUni
   comm->initState = ncclInternalError;
   *newcomm = comm;
 
+
+#ifdef POWERTUNING_TURING
+/*
+set the sm frequency to a given value
+*/
+
+//add a timer
+
+setFreq=405;//1095; 
+
+if(!nvml_on){
+  //error
+  printf("nvml not started\n");
+  //goto Error;
+}
+
+  nvml_result = nvmlDeviceGetHandleByIndex(myrank, &device);
+  if (NVML_SUCCESS != nvml_result) {
+      printf("Failed to get handle for GPU %u: %s\n", myrank, nvmlErrorString(nvml_result));
+      //goto Error;
+  }
+
+  nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
+  if (NVML_SUCCESS != nvml_result) {
+      printf("Failed to set clock frequency for GPU %u: %s\n", myrank, nvmlErrorString(nvml_result));
+      //goto Error;
+  }
+      
+    
+
+printf("set GPU locked SM frequency to 405\n");
+INFO(NCCL_ALL, "set GPU locked SM frequency to 405\n");
+
+#endif
+
+
   NCCLCHECKGOTO(ncclCalloc(&job, 1), res, fail);
   job->comm = comm;
   job->nranks = nranks;
@@ -1772,7 +1826,7 @@ NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUn
 ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank) {
   // Load the CUDA driver and dlsym hooks (can fail on old drivers)
   (void)ncclCudaLibraryInit();
-
+  
   int cudaDev;
   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
   CUDACHECK(cudaGetDevice(&cudaDev));
@@ -1780,7 +1834,8 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   NvtxParamsCommInitRank payload{myrank, nranks, cudaDev};
   NVTX3_FUNC_WITH_PARAMS(CommInitRank, CommInitRankSchema, payload)
 
-  NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, commId, myrank, cudaDev, &config));
+  NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, commId, myrank, cudaDev, &config))
+
   return ncclSuccess;
 }
 
@@ -2079,8 +2134,38 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     NVTX3_FUNC_RANGE_IN(nccl_domain);
     return ncclSuccess;
   }
+  
+
 
   int rank = comm->rank, nranks = comm->nRanks, cudaDev = comm->cudaDev;
+
+
+
+#ifdef POWERTUNING_TURING
+/*
+restore frequency and error print
+*/
+
+//nvml_result=nvmlDeviceResetGpuLockedClocks(device);
+if (NVML_SUCCESS != nvml_result) {
+    printf("Failed to reset frequency for GPU %u: %s\n", rank, nvmlErrorString(nvml_result));
+    //goto Error;
+}
+
+Error:
+    nvml_result = nvmlShutdown();
+    if (NVML_SUCCESS != nvml_result)
+        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+
+#endif
+
+
+#ifdef PROFILE
+auto trace = profiler.stopTrace();
+  std::cout << "Stopped and processed trace. Got " << trace->activities()->size() << " activities.";
+  trace->save(kFileName);
+
+#endif
 
   NvtxParamsCommInitRank payload{rank, nranks, cudaDev};
   NVTX3_FUNC_WITH_PARAMS(CommDestroy, CommInitRankSchema, payload)
