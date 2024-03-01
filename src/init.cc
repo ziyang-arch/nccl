@@ -1784,8 +1784,8 @@ if(!nvml_on){
       
     
 
-printf("set GPU locked SM frequency to 405\n");
-INFO(NCCL_ALL, "set GPU locked SM frequency to 405\n");
+//printf("set GPU locked SM frequency to 405\n");
+INFO(NCCL_ALL, "set GPU locked SM frequency to 405");
 
 #endif
 
@@ -2146,7 +2146,7 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
 restore frequency and error print
 */
 
-//nvml_result=nvmlDeviceResetGpuLockedClocks(device);
+nvml_result=nvmlDeviceResetGpuLockedClocks(device);
 if (NVML_SUCCESS != nvml_result) {
     printf("Failed to reset frequency for GPU %u: %s\n", rank, nvmlErrorString(nvml_result));
     //goto Error;
