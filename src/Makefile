@@ -46,7 +46,10 @@ STATICLIBTARGET := $(STATICLIBNAME)
 PKGTARGET  := $(PKGCONFIGFILE)
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEPFILES   := $(LIBOBJ:%.o=%.d)
-LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl -lnvidia-ml $(NVML_LIB_L) -lm
+LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl -lnvidia-ml $(NVML_LIB_L) -lm -g
+#CXXFLAGS := 
+
+
 
 DEVMANIFEST := $(BUILDDIR)/obj/device/manifest
 

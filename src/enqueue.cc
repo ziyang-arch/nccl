@@ -16,6 +16,211 @@
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
 
+#define POWERTUNING_TURING
+#ifdef POWERTUNING_TURING
+/*
+For tuning the frequency when running collectives 
+and combine the nvml command into these 
+*/
+
+#include "nvmlwrap.h"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+
+nvmlReturn_t nvml_result;
+nvmlDevice_t device;
+unsigned int device_count, i;
+int gpuIndex, setFreq;
+
+int tuning_ready=0; //flag for whether to change frequency
+
+typedef struct {
+    int size;
+    int frequency;
+    double out_of_place_busbw;
+    std::string opname;
+} Record;
+
+
+// Read data from CSV file and store it in a vector of records
+std::vector<Record> readDataFromFile(const std::string& filename) {
+    std::vector<Record> data;
+    std::ifstream file(filename);
+    std::string line;
+
+    while (std::getline(file, line)) {
+        std::istringstream iss(line);
+        std::string token;
+        Record record;
+
+        // Read comma-separated values from the line
+        std::getline(iss, token, ',');
+        if(token[0]=='s') continue; //skip the first line
+        record.size = std::stoi(token);
+        std::getline(iss, token, ',');
+        record.frequency = std::stoi(token);
+        std::getline(iss, token, ',');
+        record.out_of_place_busbw = std::stod(token);
+        std::getline(iss, record.opname, ',');
+
+        // Add the record to the data vector
+        data.push_back(record);
+    }
+
+    file.close();
+    return data;
+}
+
+// Find the minimum frequency for a specific size and operation name
+int findMinimumFrequency_noBWloss(const std::vector<Record>& data, int size, const std::string& opname) {
+
+  std::string inter_opname;
+  if(opname=="AllGather"){
+    inter_opname="all_gather";
+  }else if(opname=="AllReduce"){
+    inter_opname="all_reduce";
+  }else if(opname=="Broadcast"){
+    inter_opname="broadcast";
+  }else if(opname=="Reduce"){
+    inter_opname="reduce";
+  }else if(opname=="ReduceScatter"){
+    inter_opname="reduce_scatter";
+  }else{
+    //for all others 
+    inter_opname="sendrcev";
+  }
+
+ // Check if the specified size exists in the record vector
+    bool sizeExists = false;
+    for (const auto& record : data) {
+        if (record.size == size && record.opname == inter_opname) {
+            sizeExists = true;
+            break;
+        }
+    }
+
+    // If the specified size does not exist, find the closest data size
+    if (!sizeExists) {
+        int closestSize = INT_MAX;
+        for (const auto& record : data) {
+            if (record.opname == inter_opname) {
+                int diff = abs(record.size - size);
+                if (diff < closestSize) {
+                    closestSize = diff;
+                    size = record.size;
+                }
+            }
+        }
+    }
+    // Filter records for the specified size and operation name
+    std::vector<Record> filteredData;
+    for (const auto& record : data) {
+        if (record.size == size && record.opname == inter_opname) {
+            filteredData.push_back(record);
+        }
+    }
+
+    // Sort filtered records by out-of-place bus bandwidth in non-ascending order
+    std::sort(filteredData.begin(), filteredData.end(), [](const Record& r1, const Record& r2) {
+        return r1.out_of_place_busbw > r2.out_of_place_busbw;
+    });
+
+    // Find the minimum frequency that achieves the desired bandwidth
+    double largestBandwidth = filteredData.front().out_of_place_busbw;
+    int minFrequency = 0;
+    for (const auto& record : filteredData) {
+        if (record.out_of_place_busbw >= largestBandwidth*0.95) {
+            minFrequency = record.frequency;
+        }
+        else{
+          break;
+        }
+    }
+
+    return minFrequency;
+}
+
+int findMinimumFrequency_hardcode(int size, const std::string& opname) {
+  std::string inter_opname;
+  float delta=0;
+  if(delta>0.1){
+    if(opname=="AllGather"){
+      //inter_opname="all_gather";
+      if(size>= 2048576){
+        return 360;
+      }
+    }else if(opname=="AllReduce"){
+      //inter_opname="all_reduce";
+      if(size>= 2048576){
+        return 360;
+      }
+    }else if(opname=="Broadcast"){
+      //inter_opname="broadcast";
+      if(size>= 4000000){
+        return 300;
+      }
+    }else if(opname=="Reduce"){
+      //inter_opname="reduce";
+      if(size>= 262144){
+        return 300;
+      }
+    }else if(opname=="ReduceScatter"){
+      //inter_opname="reduce_scatter";
+      if(size>= 2000000){
+        return 360;
+      }
+    }else{
+      //for all others 
+      //inter_opname="sendrcev";
+      if(size>= 524288){
+        return 345;
+      }
+    }
+  }
+  else if(delta==0){
+    if(opname=="AllGather"){
+      //inter_opname="all_gather";
+      if(size>= 2048576){
+        return 360;
+      }
+    }else if(opname=="AllReduce"){
+      //inter_opname="all_reduce";
+      if(size>= 2048576){
+        return 675;
+      }
+    }else if(opname=="Broadcast"){
+      //inter_opname="broadcast";
+      if(size>= 4000000){
+        return 300;
+      }
+    }else if(opname=="Reduce"){
+      //inter_opname="reduce";
+      if(size>= 262144){
+        return 300;
+      }
+    }else if(opname=="ReduceScatter"){
+      //inter_opname="reduce_scatter";
+      if(size>= 2000000){
+        return 360;
+      }
+    }else{
+      //for all others 
+      //inter_opname="sendrcev";
+      if(size>= 524288){
+        return 345;
+      }
+    }
+  }
+  
+  return -1;
+}
+
+#endif //POWERTUNING_TURING
 
 
 
@@ -1325,6 +1530,88 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   size_t smem = ncclShmemDynamicSize(comm->cudaArch);
   void *args[3] = {&comm->devComm, &plan->channelMask, &plan->workHead};
 
+
+
+#ifdef POWERTUNING_TURING
+
+  /*
+  if (tuning_ready){
+    for (auto i = 0; i < device_count; i++) {
+      if (gpuIndex == -1 || gpuIndex == i) { 
+        nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            //goto Error;
+        }
+
+        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            //goto Error;
+        }
+      }
+    }
+  }
+*/
+
+//set for local GPU
+
+  /*
+  if (tuning_ready){
+    i=comm->rank;
+    nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            //goto Error;
+        }
+
+        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            //goto Error;
+        }
+  }
+*/
+
+  #include <sys/types.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+
+ //pid_t x = syscall(__NR_gettid);
+//printf("thread id of ncclLaunchKernel %ld\n", x);
+
+  if(tuning_ready>0){
+    if(comm->rank==0){
+
+      /*
+      nvml_result = nvmlInit_v2();
+      //printf("initialize nvml in ncclCommInitRankDev\n");
+      if (NVML_SUCCESS != nvml_result) {
+          printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+          //goto Error;
+      }
+      */
+
+      for (i = 0; i < device_count; i++) {
+        nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("In ncclLaunchKernel Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            //goto Error;
+        }
+
+        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
+        if (NVML_SUCCESS != nvml_result) {
+            printf("In ncclLaunchKernel Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+            //goto Error;
+        }
+      }
+    }
+  }
+  
+  
+#endif
+
   #if CUDART_VERSION >= 11080
   int driverVersion;
   NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
@@ -1425,6 +1712,54 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
     NCCLCHECKGOTO(ncclStrongStreamRelease(tasks->capturingGraph, &comm->sharedRes->deviceStream), result, resume3);
   resume3:;
   }
+
+  #ifdef POWERTUNING_TURING
+/*
+restore frequency and error print
+*/
+if(tuning_ready>0){
+  //pid_t x = syscall(__NR_gettid);
+  //printf("thread id of ncclLaunchFinish %ld, reset for rank %d\n", x, i);
+  if(comm->rank==0){
+    /*
+    nvml_result = nvmlInit_v2();
+    //printf("initialize nvml in ncclCommInitRankDev\n");
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+        //goto Error;
+    }
+    */
+
+    for(i=0; i<device_count; i++){
+      nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
+      if (NVML_SUCCESS != nvml_result) {
+          printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+          //goto Error;
+      }
+
+      nvml_result=nvmlDeviceResetGpuLockedClocks(device);
+      if (NVML_SUCCESS != nvml_result) {
+          printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+          //goto Error;
+      }
+  tuning_ready--;
+    }
+  }
+    
+    
+
+    
+}
+
+//change this to macro NVMLCHECK
+Error:
+    nvml_result = nvmlShutdown();
+    if (NVML_SUCCESS != nvml_result)
+        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+
+#endif
+
+
   return result;
 }
 
@@ -1957,10 +2292,72 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   return ncclSuccess;
 }
 
+
+
+
 ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
   NCCLCHECK(ncclGroupStartInternal());
   ncclResult_t ret = ncclSuccess;
   int devOld = -1;
+
+
+/*
+setfreq initialization
+*/
+#ifdef POWERTUNING_TURING
+/*
+   nvml_result = nvmlInit_v2();
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+        //goto Error;
+    }
+    */
+    /*
+    nvml_result = nvmlDeviceGetCount(&device_count);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
+        //goto Error;
+    }
+    */
+
+    /*
+    set the sm frequency to the optimal value
+    */
+
+    //select
+    //setFreq =405;
+    //tuning_ready=true;
+
+
+    //find frequency from file
+    /*
+    const std::string model_data_path="/data3/zjia016/DVFS_NVGPU/nccl_frequency/output/frequency_bw_all.csv";
+    std::vector<Record> model_data = readDataFromFile(model_data_path);
+
+    size_t payload_size =ncclTypeSize(info->datatype)*info->count;
+    setFreq = findMinimumFrequency_noBWloss(model_data, payload_size, info->opName);
+    
+    */
+
+   
+
+
+    //get frequency from hardcode func
+    size_t payload_size =ncclTypeSize(info->datatype)*info->count;
+    setFreq = findMinimumFrequency_hardcode(payload_size, info->opName);
+    //setFreq=1590;
+
+    if(setFreq>0){
+        //if freFreq is -1 , abort to use default mode 
+        tuning_ready=device_count;
+        INFO(NCCL_ALL, "set target frequency to %d, tuning_ready=%d", setFreq, tuning_ready);
+    }
+    else{
+      INFO(NCCL_ALL, "search fail, setFreq is %d", setFreq);
+    }
+
+#endif 
+
 
   NCCLCHECKGOTO(PtrCheck(info->comm, info->opName, "comm"), ret, fail);
   // Check whether communicator is ready to communicate
@@ -1978,6 +2375,8 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
   TRACE_CALL("nccl%s(%" PRIx64 ",%" PRIx64 ",%zi,%d,%d,%d,%p,%p)", info->opName, reinterpret_cast<int64_t>(info->sendbuff), reinterpret_cast<int64_t>(info->recvbuff), info->count, info->datatype, info->op, info->root, info->comm, info->stream);
 
   NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);
+
+
 
 exit:
   if (devOld != -1) CUDACHECK(cudaSetDevice(devOld));

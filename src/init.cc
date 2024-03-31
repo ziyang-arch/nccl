@@ -36,6 +36,19 @@
 #define NCCL_GROUP_CUDA_STREAM 1 // CGMD: CUDA 9.0,9.1 Need to use an internal CUDA stream
 #endif
 
+
+#define POWERTUNING_TURING
+#ifdef POWERTUNING_TURING
+/*
+For tuning the frequency when running collectives 
+and combine the nvml command into these 
+*/
+
+#include "nvmlwrap.h"
+extern nvmlReturn_t nvml_result;
+extern unsigned int device_count;
+#endif //POWERTUNING_TURING
+
 const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
 const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree" };
 const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
@@ -88,6 +101,8 @@ static ncclResult_t ncclInit() {
     __atomic_store_n(&initialized, true, __ATOMIC_RELEASE);
   }
   pthread_mutex_unlock(&initLock);
+
+
   return ncclSuccess;
 }
 
@@ -1708,6 +1723,33 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUni
   ncclComm_t comm = NULL;
   struct ncclCommInitRankAsyncJob *job = NULL;
   const char* env = ncclGetEnv("NCCL_COMM_ID");
+
+  #ifdef POWERTUNING_TURING
+  #include <sys/types.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+
+ //pid_t x = syscall(__NR_gettid);
+//printf("thread id of ncclCommInitRankDev %ld\n", x);
+
+  if(myrank==0){
+   nvml_result = nvmlInit_v2();
+   //printf("initialize nvml in ncclCommInitRankDev\n");
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+        //goto Error;
+    }
+  }
+
+    nvml_result = nvmlDeviceGetCount_v2(&device_count);
+    //printf("device_count %d\n", device_count);
+    if (NVML_SUCCESS != nvml_result ) {
+        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
+        //goto Error;
+    }
+#endif
+
   if (env && myrank == 0) {
     INFO(NCCL_ENV, "NCCL_COMM_ID set by environment to %s", env);
     NCCLCHECKGOTO(bootstrapCreateRoot((struct ncclBootstrapHandle*)&commId, true), res, fail);
@@ -1781,6 +1823,9 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   NVTX3_FUNC_WITH_PARAMS(CommInitRank, CommInitRankSchema, payload)
 
   NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, commId, myrank, cudaDev, &config));
+  
+
+
   return ncclSuccess;
 }
 
@@ -2079,6 +2124,13 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     NVTX3_FUNC_RANGE_IN(nccl_domain);
     return ncclSuccess;
   }
+
+  #ifdef POWERTUNING_TURING
+  printf("nvmlShutdown in ncclCommDestroy\n");
+  nvml_result = nvmlShutdown();
+    if (NVML_SUCCESS != nvml_result)
+        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+  #endif //POWERTUNING_TUNING
 
   int rank = comm->rank, nranks = comm->nRanks, cudaDev = comm->cudaDev;
 
