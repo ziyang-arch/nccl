@@ -2305,13 +2305,19 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
 setfreq initialization
 */
 #ifdef POWERTUNING_TURING
-/*
+
    nvml_result = nvmlInit_v2();
     if (NVML_SUCCESS != nvml_result) {
         printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
         //goto Error;
     }
-    */
+    nvml_result = nvmlDeviceGetCount_v2(&device_count);
+    //printf("device_count %d\n", device_count);
+    if (NVML_SUCCESS != nvml_result ) {
+        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
+        //goto Error;
+    }
+   
     /*
     nvml_result = nvmlDeviceGetCount(&device_count);
     if (NVML_SUCCESS != nvml_result) {
