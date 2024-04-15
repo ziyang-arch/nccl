@@ -31,13 +31,32 @@ and combine the nvml command into these
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <thread>
+
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 nvmlReturn_t nvml_result;
 nvmlDevice_t device;
 unsigned int device_count, i;
-int gpuIndex, setFreq;
+int gpuIndex;
 
-int tuning_ready=0; //flag for whether to change frequency
+
+//int tuning_ready=0; 
+
+pthread_t thread_id; //thread for nvml
+
+// Define a structure to pass arguments to the thread function
+typedef struct {
+    int setFreq;
+    int tuning_ready; //flag for whether to change frequency
+    int payload_size; 
+    int cudaDevice;
+} ThreadArgs;
+
+
+ThreadArgs tuningArgs; //args used for frequency scaling
 
 typedef struct {
     int size;
@@ -45,6 +64,165 @@ typedef struct {
     double out_of_place_busbw;
     std::string opname;
 } Record;
+
+
+// Thread function to set frequency for GPUs
+void setFrequency(ThreadArgs tuningArgs) {
+    //struct ThreadArgs* tuningArgs = (struct ThreadArgs*)arg;
+
+    
+
+    nvmlReturn_t nvml_result;
+    nvmlDevice_t device;
+    int device_count;
+    int i;
+
+    #include <chrono>
+    auto start_time = std::chrono::steady_clock::now();
+    if (tuningArgs.setFreq > 0) {
+
+        // Initialize NVML
+        nvml_result = nvmlInit_v2();
+        if (NVML_SUCCESS != nvml_result) {
+            printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+
+        }
+
+        INFO(NCCL_ALL, "for payload size %d, set target frequency to %d, tuning_ready=%d", tuningArgs.payload_size, tuningArgs.setFreq, tuningArgs.tuning_ready);
+
+        // Check if tuning is ready
+        if (tuningArgs.tuning_ready > 0) {
+            device_count = tuningArgs.tuning_ready;
+            for (i = 0; i < device_count; i++) {
+                pid_t x = syscall(__NR_gettid);
+                INFO(NCCL_ALL, "thread id of setFrequency %ld", x);
+                INFO(NCCL_ALL, "set frequency for gpu rank %d out of %d", i, device_count);
+                // Get handle for GPU
+                nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
+                if (NVML_SUCCESS != nvml_result) {
+                    printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+                    continue;
+                }
+
+                // Set clock frequency for GPU
+                nvml_result = nvmlDeviceSetGpuLockedClocks(device, tuningArgs.setFreq, tuningArgs.setFreq);
+                if (NVML_SUCCESS != nvml_result) {
+                    printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+                    continue;
+                }
+            }
+        }
+        
+    } else {
+        INFO(NCCL_ALL, "search fail for payload size %d, setFreq is %d", tuningArgs.payload_size, tuningArgs.setFreq);
+    }
+
+    // Shutdown NVML
+    //nvmlShutdown();
+     // Calculate the duration in microseconds
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    INFO(NCCL_ALL, "Time taken to set frequency : %ld", duration_us); 
+
+}
+
+
+void setFrequency_localrank(ThreadArgs tuningArgs){
+  //this function inside nccllaunchkernel will only set freuqnecy for the local rank 
+  nvmlReturn_t nvml_result;
+  nvmlDevice_t device;
+
+  //int i; //i is the cudadevice number
+  //cudaGetDevice(&i);
+  //
+
+  int i=tuningArgs.cudaDevice;
+  INFO(NCCL_ALL,"current rank in setFrequency_localrank is %d", i);
+  // Check if tuning is ready
+  if (tuningArgs.tuning_ready > 0) {
+
+    nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+
+    }
+
+    // Set clock frequency for GPU
+    nvml_result = nvmlDeviceSetGpuLockedClocks(device, tuningArgs.setFreq, tuningArgs.setFreq);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+
+    }
+  }
+  
+
+}
+
+
+// Thread function to reset frequency for GPUs
+void resetFrequency(ThreadArgs tuningArgs) {
+    nvmlReturn_t nvml_result;
+    nvmlDevice_t device;
+    int i;
+    
+    pid_t x = syscall(__NR_gettid);
+    INFO(NCCL_ALL, "thread id of resetFrequency %ld", x);
+
+    auto start_time = std::chrono::steady_clock::now();
+
+    if (tuningArgs.tuning_ready > 0) {
+      int device_count=tuningArgs.tuning_ready;
+        for (i = 0; i < device_count; i++) {
+            INFO(NCCL_ALL, "reset frequency for gpu rank %d", i);
+            nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
+            if (NVML_SUCCESS != nvml_result) {
+                printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+                continue;
+            }
+
+            nvml_result = nvmlDeviceResetGpuLockedClocks(device);
+            if (NVML_SUCCESS != nvml_result) {
+                printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+                continue;
+            }
+            tuningArgs.tuning_ready--;
+        }
+    }
+    // Shutdown NVML
+    nvmlShutdown();
+    // Calculate the duration in microseconds
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    INFO(NCCL_ALL, "Time taken to reset frequency: %ld", duration_us);
+}
+
+void resetFrequency_localrank(ThreadArgs tuningArgs){
+  nvmlReturn_t nvml_result;
+  nvmlDevice_t device;
+
+  //int i; //i is the cudadevice number
+  //cudaGetDevice(&i);
+  
+
+  int i=tuningArgs.cudaDevice;
+  INFO(NCCL_ALL,"current rank in resetFrequency_localrank is %d", i);
+  if (tuningArgs.tuning_ready > 0) {
+    nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+
+    }
+
+    nvml_result = nvmlDeviceResetGpuLockedClocks(device);
+    if (NVML_SUCCESS != nvml_result) {
+        printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+
+    }
+    tuningArgs.tuning_ready--;
+}
+
+}
+
 
 
 // Read data from CSV file and store it in a vector of records
@@ -156,7 +334,7 @@ int findMinimumFrequency_hardcode(int size, const std::string& opname) {
       }
     }else if(opname=="AllReduce"){
       //inter_opname="all_reduce";
-      if(size>= 2048576){
+      if(size>= 4200000){
         return 360;
       }
     }else if(opname=="Broadcast"){
@@ -190,13 +368,16 @@ int findMinimumFrequency_hardcode(int size, const std::string& opname) {
       }
     }else if(opname=="AllReduce"){
       //inter_opname="all_reduce";
-      if(size>= 2048576){
-        return 675;
+      if(size>= 4194304 ){
+        return 435;
+      }
+      else if(size>=2097152){
+        return 900;
       }
     }else if(opname=="Broadcast"){
       //inter_opname="broadcast";
-      if(size>= 4000000){
-        return 300;
+      if(size>= 4194304){
+        return 450;
       }
     }else if(opname=="Reduce"){
       //inter_opname="reduce";
@@ -1530,7 +1711,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   size_t smem = ncclShmemDynamicSize(comm->cudaArch);
   void *args[3] = {&comm->devComm, &plan->channelMask, &plan->workHead};
 
-
+  //int i; //i is the cudadevice number
+  //cudaGetDevice(&i);
+  //INFO(NCCL_ALL,"current rank in ncclLaunchKernel is %d", i);
 
 #ifdef POWERTUNING_TURING
 
@@ -1555,10 +1738,10 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 */
 
 //set for local GPU
-
-  /*
+/*
   if (tuning_ready){
     i=comm->rank;
+    INFO(NCCL_ALL, "set frequency for gpu rank %d", i);
     nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
         if (NVML_SUCCESS != nvml_result) {
             printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
@@ -1573,27 +1756,23 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   }
 */
 
-  #include <sys/types.h>
-#include <unistd.h>
-#include <sys/syscall.h>
 
-
- //pid_t x = syscall(__NR_gettid);
+//#include <sys/types.h>
+//#include <unistd.h>
+//#include <sys/syscall.h>
+//pid_t x = syscall(__NR_gettid);
 //printf("thread id of ncclLaunchKernel %ld\n", x);
+
+/*
+#include <chrono>
+auto start_time = std::chrono::steady_clock::now();
+
 
   if(tuning_ready>0){
     if(comm->rank==0){
-
-      /*
-      nvml_result = nvmlInit_v2();
-      //printf("initialize nvml in ncclCommInitRankDev\n");
-      if (NVML_SUCCESS != nvml_result) {
-          printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
-          //goto Error;
-      }
-      */
-
+      device_count=tuning_ready;
       for (i = 0; i < device_count; i++) {
+        INFO(NCCL_ALL, "set frequency for gpu rank %d", i);
         nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
         if (NVML_SUCCESS != nvml_result) {
             printf("In ncclLaunchKernel Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
@@ -1608,8 +1787,28 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       }
     }
   }
-  
-  
+
+
+ // Calculate the duration in microseconds
+  auto end_time = std::chrono::steady_clock::now();
+  auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+ INFO(NCCL_ALL, "Time taken to set frequency : %ld", duration_us); 
+  */
+
+
+
+    int i; //i is the cudadevice number
+    cudaGetDevice(&i);
+    tuningArgs.cudaDevice=i;
+    // Assign values to the arguments structure
+    std::thread set_thread(setFrequency_localrank,  tuningArgs); //.setFreq, tuningArgs.payload_size, tuningArgs.tuning_ready
+
+    // Detach the thread
+    set_thread.detach();
+
+
+
+
 #endif
 
   #if CUDART_VERSION >= 11080
@@ -1714,23 +1913,24 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
   }
 
   #ifdef POWERTUNING_TURING
+
+
+
 /*
 restore frequency and error print
 */
+/*
 if(tuning_ready>0){
   //pid_t x = syscall(__NR_gettid);
   //printf("thread id of ncclLaunchFinish %ld, reset for rank %d\n", x, i);
-  if(comm->rank==0){
-    /*
-    nvml_result = nvmlInit_v2();
-    //printf("initialize nvml in ncclCommInitRankDev\n");
-    if (NVML_SUCCESS != nvml_result) {
-        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
-        //goto Error;
-    }
-    */
 
+auto start_time = std::chrono::steady_clock::now();
+
+  
+  if(comm->rank==0){
+    device_count=tuning_ready;
     for(i=0; i<device_count; i++){
+      INFO(NCCL_ALL, "reset frequency for gpu rank %d", i);
       nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
       if (NVML_SUCCESS != nvml_result) {
           printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
@@ -1738,26 +1938,32 @@ if(tuning_ready>0){
       }
 
       nvml_result=nvmlDeviceResetGpuLockedClocks(device);
+
       if (NVML_SUCCESS != nvml_result) {
           printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
           //goto Error;
       }
-  tuning_ready--;
+      tuning_ready--;
     }
   }
+  INFO(NCCL_ALL, "after reset tuning_ready is %d", tuning_ready);
     
-    
+ // Calculate the duration in microseconds
+  auto end_time = std::chrono::steady_clock::now();
+  auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+  INFO(NCCL_ALL, "Time taken to reset frequency : %ld", duration_us); 
+  */
 
-    
-}
+    int i; //i is the cudadevice number
+    cudaGetDevice(&i);
+    tuningArgs.cudaDevice=i;
 
-//change this to macro NVMLCHECK
-Error:
-    nvml_result = nvmlShutdown();
-    if (NVML_SUCCESS != nvml_result)
-        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+    std::thread reset_thread(resetFrequency_localrank, tuningArgs);
 
-#endif
+    // Detach the thread
+    reset_thread.detach();
+
+#endif //POWERTUNING_TURING
 
 
   return result;
@@ -2306,18 +2512,6 @@ setfreq initialization
 */
 #ifdef POWERTUNING_TURING
 
-   nvml_result = nvmlInit_v2();
-    if (NVML_SUCCESS != nvml_result) {
-        printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
-        //goto Error;
-    }
-    nvml_result = nvmlDeviceGetCount_v2(&device_count);
-    //printf("device_count %d\n", device_count);
-    if (NVML_SUCCESS != nvml_result ) {
-        printf("Failed to query GPU count: %s\n", nvmlErrorString(nvml_result));
-        //goto Error;
-    }
-   
     /*
     nvml_result = nvmlDeviceGetCount(&device_count);
     if (NVML_SUCCESS != nvml_result) {
@@ -2340,27 +2534,34 @@ setfreq initialization
     const std::string model_data_path="/data3/zjia016/DVFS_NVGPU/nccl_frequency/output/frequency_bw_all.csv";
     std::vector<Record> model_data = readDataFromFile(model_data_path);
 
-    size_t payload_size =ncclTypeSize(info->datatype)*info->count;
+    payload_size =ncclTypeSize(info->datatype)*info->count;
     setFreq = findMinimumFrequency_noBWloss(model_data, payload_size, info->opName);
     
     */
 
    
 
-
     //get frequency from hardcode func
-    size_t payload_size =ncclTypeSize(info->datatype)*info->count;
-    setFreq = findMinimumFrequency_hardcode(payload_size, info->opName);
-    //setFreq=1590;
+    tuningArgs.payload_size =ncclTypeSize(info->datatype)*info->count;
+    tuningArgs.setFreq = findMinimumFrequency_hardcode(tuningArgs.payload_size, info->opName);
+    tuningArgs.setFreq=1590;
 
-    if(setFreq>0){
+    if(tuningArgs.setFreq>0){
         //if freFreq is -1 , abort to use default mode 
-        tuning_ready=device_count;
-        INFO(NCCL_ALL, "set target frequency to %d, tuning_ready=%d", setFreq, tuning_ready);
+      nvml_result = nvmlInit_v2();
+      if (NVML_SUCCESS != nvml_result) {
+          printf("Failed to initialize NVML: %s\n", nvmlErrorString(nvml_result));
+          //goto Error;
+      }
+
+      tuningArgs.tuning_ready=info->comm->localRanks; //gpu on one node, nRanks is the number of all GPU 
+      INFO(NCCL_ALL, "for payload size %d, set target frequency to %d, tuning_ready=%d",tuningArgs.payload_size,  tuningArgs.setFreq, tuningArgs.tuning_ready);
     }
     else{
-      INFO(NCCL_ALL, "search fail, setFreq is %d", setFreq);
+      INFO(NCCL_ALL, "search fail for payload size %d, setFreq is %d",tuningArgs.payload_size, tuningArgs.setFreq);
     }
+
+
 
 #endif 
 

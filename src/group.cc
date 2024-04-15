@@ -139,6 +139,8 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
   // same global entity. We calculate a clique as all comms which have the same
   // `intraComm0` value.
 
+  
+
   do {
     struct ncclComm* comm = cliqueHead;
     bool capturingYes = false, capturingNo = false;
