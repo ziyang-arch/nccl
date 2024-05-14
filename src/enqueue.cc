@@ -22,6 +22,9 @@
 For tuning the frequency when running collectives 
 and combine the nvml command into these 
 */
+#include <cuda_runtime.h>
+
+
 
 #include "nvmlwrap.h"
 #include <iostream>
@@ -36,11 +39,16 @@ and combine the nvml command into these
 #include <sys/types.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
+
+
 
 nvmlReturn_t nvml_result;
-nvmlDevice_t device;
-unsigned int device_count, i;
-int gpuIndex;
+//nvmlDevice_t device;
+unsigned int device_count;
+
+#define MIN_FREQ 300
+#define MAX_FREQ 1590
 
 
 //int tuning_ready=0; 
@@ -52,11 +60,11 @@ typedef struct {
     int setFreq;
     int tuning_ready; //flag for whether to change frequency
     int payload_size; 
-    int cudaDevice;
+    //int cudaDevice;   // does this cause collision when multiple gpu set frequency 
 } ThreadArgs;
 
 
-ThreadArgs tuningArgs; //args used for frequency scaling
+ThreadArgs tuningArgs; //args used for frequency scaling as global value and only pass the 
 
 typedef struct {
     int size;
@@ -127,7 +135,7 @@ void setFrequency(ThreadArgs tuningArgs) {
 }
 
 
-void setFrequency_localrank(ThreadArgs tuningArgs){
+void setFrequency_localrank(int cudaDevice){
   //this function inside nccllaunchkernel will only set freuqnecy for the local rank 
   nvmlReturn_t nvml_result;
   nvmlDevice_t device;
@@ -136,21 +144,27 @@ void setFrequency_localrank(ThreadArgs tuningArgs){
   //cudaGetDevice(&i);
   //
 
-  int i=tuningArgs.cudaDevice;
-  INFO(NCCL_ALL,"current rank in setFrequency_localrank is %d", i);
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  //printf("The timestamp is: %ld.%06ld\n", tv.tv_sec, tv.tv_usec);
+
+
+  //int i=tuningArgs.cudaDevice;
+
+  INFO(NCCL_ALL,"timestamp is: %ld.%06ld, current rank in setFrequency_localrank is %d",tv.tv_sec, tv.tv_usec, cudaDevice);
   // Check if tuning is ready
   if (tuningArgs.tuning_ready > 0) {
 
-    nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
+    nvml_result = nvmlDeviceGetHandleByIndex_v2(cudaDevice, &device);
     if (NVML_SUCCESS != nvml_result) {
-        printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+        printf("Failed to get handle for GPU %u: %s\n", cudaDevice, nvmlErrorString(nvml_result));
 
     }
 
     // Set clock frequency for GPU
     nvml_result = nvmlDeviceSetGpuLockedClocks(device, tuningArgs.setFreq, tuningArgs.setFreq);
     if (NVML_SUCCESS != nvml_result) {
-        printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
+        printf("Failed to set clock frequency for GPU %u: %s\n", cudaDevice, nvmlErrorString(nvml_result));
 
     }
   }
@@ -196,32 +210,80 @@ void resetFrequency(ThreadArgs tuningArgs) {
     INFO(NCCL_ALL, "Time taken to reset frequency: %ld", duration_us);
 }
 
-void resetFrequency_localrank(ThreadArgs tuningArgs){
+void resetFrequency_localrank(int cudaDevice){
   nvmlReturn_t nvml_result;
   nvmlDevice_t device;
 
-  //int i; //i is the cudadevice number
-  //cudaGetDevice(&i);
+  int i; //i is the cudadevice number
+  cudaGetDevice(&i);
   
 
-  int i=tuningArgs.cudaDevice;
-  INFO(NCCL_ALL,"current rank in resetFrequency_localrank is %d", i);
-  if (tuningArgs.tuning_ready > 0) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+
+  //int i=tuningArgs.cudaDevice;
+  INFO(NCCL_ALL,"timestamp is: %ld.%06ld, current rank in resetFrequency_localrank is %d, use set clock with range",  tv.tv_sec, tv.tv_usec, cudaDevice);
+  if (true) {  //tuningArgs.tuning_ready > 0
     nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
     if (NVML_SUCCESS != nvml_result) {
         printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
 
     }
 
-    nvml_result = nvmlDeviceResetGpuLockedClocks(device);
+    //nvml_result = nvmlDeviceResetGpuLockedClocks(device);
+    nvml_result = nvmlDeviceSetGpuLockedClocks(device, MIN_FREQ, MAX_FREQ);
     if (NVML_SUCCESS != nvml_result) {
         printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
 
     }
-    tuningArgs.tuning_ready--;
+
 }
 
 }
+
+
+//ThreadArgs tuningArgs
+void set_streamtask(void* cudaDevicePtr){
+    //ThreadArgs tuningArgs_ondevice = *static_cast<ThreadArgs*>(tuningArgsPtr);
+    int idx=*static_cast<int*>(cudaDevicePtr);
+
+    //INFO(NCCL_ALL,"in set_streamtask, members in tuningArgs_ondevice: setFreq: %d, tuning_ready:%d, payload_size:%d, cudaDevice:%d", tuningArgs_ondevice.setFreq, tuningArgs_ondevice.tuning_ready, tuningArgs_ondevice.payload_size, tuningArgs_ondevice.cudaDevice );
+    INFO(NCCL_ALL, "in set_streamtask, device %d", idx);
+
+    if(tuningArgs.setFreq>0){
+
+      //INFO(NCCL_ALL,"current rank in reset_streamtask is %d", tuningArgs_ondevice.cudaDevice);
+
+      //tuningArgs.cudaDevice=i;
+
+      std::thread reset_thread(setFrequency_localrank, idx);
+
+      // Detach the thread
+      reset_thread.detach();
+    }
+}
+
+//ThreadArgs tuningArgs
+void reset_streamtask(void* cudaDevicePtr){
+    //ThreadArgs tuningArgs_ondevice = *static_cast<ThreadArgs*>(tuningArgsPtr);
+    int idx=*static_cast<int*>(cudaDevicePtr);
+
+    //INFO(NCCL_ALL,"in reset_streamtask, members in tuningArgs_ondevice: setFreq: %d, tuning_ready:%d, payload_size:%d, cudaDevice:%d", tuningArgs_ondevice.setFreq, tuningArgs_ondevice.tuning_ready, tuningArgs_ondevice.payload_size, tuningArgs_ondevice.cudaDevice );
+    INFO(NCCL_ALL, "in reset_streamtask, device %d", idx);
+
+    if(tuningArgs.setFreq>0){
+
+      //INFO(NCCL_ALL,"current rank in reset_streamtask is %d", tuningArgs_ondevice.cudaDevice);
+
+      //tuningArgs.cudaDevice=i;
+
+      std::thread reset_thread(resetFrequency_localrank, idx);
+
+      // Detach the thread
+      reset_thread.detach();
+    }
+}
+
 
 
 
@@ -364,12 +426,12 @@ int findMinimumFrequency_hardcode(int size, const std::string& opname) {
     if(opname=="AllGather"){
       //inter_opname="all_gather";
       if(size>= 2048576){
-        return 360;
+        return 450;
       }
     }else if(opname=="AllReduce"){
       //inter_opname="all_reduce";
       if(size>= 4194304 ){
-        return 435;
+        return 480;
       }
       else if(size>=2097152){
         return 900;
@@ -382,18 +444,18 @@ int findMinimumFrequency_hardcode(int size, const std::string& opname) {
     }else if(opname=="Reduce"){
       //inter_opname="reduce";
       if(size>= 262144){
-        return 300;
+        return 450;
       }
     }else if(opname=="ReduceScatter"){
       //inter_opname="reduce_scatter";
-      if(size>= 2000000){
-        return 360;
+      if(size>= 2097152){
+        return 450;
       }
     }else{
       //for all others 
       //inter_opname="sendrcev";
-      if(size>= 524288){
-        return 345;
+      if(size>= 4194304){
+        return 805;
       }
     }
   }
@@ -1584,6 +1646,13 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
   bool persistent = ncclCudaGraphValid(tasks->capturingGraph);
   int nPlans = 0;
 
+  //int i; //i is the cudadevice number
+  //cudaGetDevice(&i);
+  //INFO(NCCL_ALL,"current rank in ncclLaunchPrepare is %d", i);
+
+
+
+
   // Poll for callbacks sent to us from other threads. Typically these free
   // resources from to our memory pools.
   NCCLCHECK(ncclCommPollCallbacks(comm, /*waitSome=*/false));
@@ -1676,6 +1745,7 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       }
     }
 
+
     if (persistent) {
       comm->persistentRefs += nPlans;
       NCCLCHECKGOTO(ncclCudaGraphAddDestructor(tasks->capturingGraph, persistentDestructor, (void*)planHead), result, failure);
@@ -1711,105 +1781,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   size_t smem = ncclShmemDynamicSize(comm->cudaArch);
   void *args[3] = {&comm->devComm, &plan->channelMask, &plan->workHead};
 
-  //int i; //i is the cudadevice number
-  //cudaGetDevice(&i);
-  //INFO(NCCL_ALL,"current rank in ncclLaunchKernel is %d", i);
-
-#ifdef POWERTUNING_TURING
-
-  /*
-  if (tuning_ready){
-    for (auto i = 0; i < device_count; i++) {
-      if (gpuIndex == -1 || gpuIndex == i) { 
-        nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            //goto Error;
-        }
-
-        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            //goto Error;
-        }
-      }
-    }
-  }
-*/
-
-//set for local GPU
-/*
-  if (tuning_ready){
-    i=comm->rank;
-    INFO(NCCL_ALL, "set frequency for gpu rank %d", i);
-    nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            //goto Error;
-        }
-
-        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            //goto Error;
-        }
-  }
-*/
-
-
-//#include <sys/types.h>
-//#include <unistd.h>
-//#include <sys/syscall.h>
-//pid_t x = syscall(__NR_gettid);
-//printf("thread id of ncclLaunchKernel %ld\n", x);
-
-/*
-#include <chrono>
-auto start_time = std::chrono::steady_clock::now();
-
-
-  if(tuning_ready>0){
-    if(comm->rank==0){
-      device_count=tuning_ready;
-      for (i = 0; i < device_count; i++) {
-        INFO(NCCL_ALL, "set frequency for gpu rank %d", i);
-        nvml_result = nvmlDeviceGetHandleByIndex_v2(i, &device);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("In ncclLaunchKernel Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            //goto Error;
-        }
-
-        nvml_result = nvmlDeviceSetGpuLockedClocks(device, setFreq, setFreq);
-        if (NVML_SUCCESS != nvml_result) {
-            printf("In ncclLaunchKernel Failed to set clock frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-            //goto Error;
-        }
-      }
-    }
-  }
-
-
- // Calculate the duration in microseconds
-  auto end_time = std::chrono::steady_clock::now();
-  auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
- INFO(NCCL_ALL, "Time taken to set frequency : %ld", duration_us); 
-  */
-
-
-
-    int i; //i is the cudadevice number
-    cudaGetDevice(&i);
-    tuningArgs.cudaDevice=i;
-    // Assign values to the arguments structure
-    std::thread set_thread(setFrequency_localrank,  tuningArgs); //.setFreq, tuningArgs.payload_size, tuningArgs.tuning_ready
-
-    // Detach the thread
-    set_thread.detach();
-
-
-
-
-#endif
+  
 
   #if CUDART_VERSION >= 11080
   int driverVersion;
@@ -1859,6 +1831,12 @@ auto start_time = std::chrono::steady_clock::now();
   #endif
   // Standard kernel launch
   CUDACHECK(cudaLaunchKernel(fn, grid, block, args, smem, launchStream));
+
+  //print launchstream number 
+  //unsigned long long streamId;
+  //cudaError_t err = cudaStreamGetId(launchStream, &streamId);
+  //INFO(NCCL_ALL, "kernel launchStream ID: %llu", streamId);
+
   return ncclSuccess;
 }
 
@@ -1912,59 +1890,52 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
   resume3:;
   }
 
-  #ifdef POWERTUNING_TURING
+
+#ifdef POWERTUNING_TURING
 
 
-
-/*
-restore frequency and error print
-*/
-/*
-if(tuning_ready>0){
-  //pid_t x = syscall(__NR_gettid);
-  //printf("thread id of ncclLaunchFinish %ld, reset for rank %d\n", x, i);
-
-auto start_time = std::chrono::steady_clock::now();
-
-  
-  if(comm->rank==0){
-    device_count=tuning_ready;
-    for(i=0; i<device_count; i++){
-      INFO(NCCL_ALL, "reset frequency for gpu rank %d", i);
-      nvml_result = nvmlDeviceGetHandleByIndex(i, &device);
-      if (NVML_SUCCESS != nvml_result) {
-          printf("Failed to get handle for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-          //goto Error;
-      }
-
-      nvml_result=nvmlDeviceResetGpuLockedClocks(device);
-
-      if (NVML_SUCCESS != nvml_result) {
-          printf("Failed to reset frequency for GPU %u: %s\n", i, nvmlErrorString(nvml_result));
-          //goto Error;
-      }
-      tuning_ready--;
+    //display all streams
+    /*
+    struct ncclCudaStreamList* sl = tasks->streams->next;
+    while (sl != nullptr) {
+      unsigned long long streamId;
+      cudaError_t err = cudaStreamGetId((sl->stream), &streamId);
+      INFO(NCCL_ALL, "Stream ID: %llu\n", streamId);
+      sl = sl->next;
     }
-  }
-  INFO(NCCL_ALL, "after reset tuning_ready is %d", tuning_ready);
-    
- // Calculate the duration in microseconds
-  auto end_time = std::chrono::steady_clock::now();
-  auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-  INFO(NCCL_ALL, "Time taken to reset frequency : %ld", duration_us); 
-  */
+    */
 
+
+    /*
     int i; //i is the cudadevice number
     cudaGetDevice(&i);
-    tuningArgs.cudaDevice=i;
+    //comm->cudaDev
+    INFO(NCCL_ALL, "launch cudaLaunchHostFunc(launchStream on device %d, comm->cudaDev %d", i, comm->cudaDev );
+    
+    
+    
+    cudaStream_t deviceStream = comm->sharedRes->deviceStream.cudaStream;
+    cudaStream_t hostStream = comm->sharedRes->hostStream.cudaStream;
+    //cudaStream_t userStream = tasks->streams->stream;
+    unsigned long long streamId;
+    cudaError_t err = cudaStreamGetId(deviceStream, &streamId);
+    INFO(NCCL_ALL, "deviceStream ID: %llu", streamId);
+    err = cudaStreamGetId(hostStream, &streamId);
+    INFO(NCCL_ALL, "hostStream ID: %llu", streamId);
+    //err = cudaStreamGetId(userStream, &streamId);
+    //INFO(NCCL_ALL, "userStream ID: %llu", streamId);
 
-    std::thread reset_thread(resetFrequency_localrank, tuningArgs);
+    //INFO(NCCL_ALL,"in ncclLaunchFinish, members in tuningArgs_ondevice: setFreq: %d, tuning_ready:%d, payload_size:%d, cudaDevice:%d", tuningArgs_ondevice.setFreq, tuningArgs_ondevice.tuning_ready, tuningArgs_ondevice.payload_size, tuningArgs_ondevice.cudaDevice );
 
-    // Detach the thread
-    reset_thread.detach();
 
+
+    //append reset task to the launchStream here
+    
+    cudaHostFn_t fn = &reset_streamtask;
+    cudaLaunchHostFunc(deviceStream, fn, &i);
+    */
+  
 #endif //POWERTUNING_TURING
-
 
   return result;
 }
@@ -2540,11 +2511,11 @@ setfreq initialization
     */
 
    
-
+    nvmlReturn_t nvml_result;
     //get frequency from hardcode func
     tuningArgs.payload_size =ncclTypeSize(info->datatype)*info->count;
     tuningArgs.setFreq = findMinimumFrequency_hardcode(tuningArgs.payload_size, info->opName);
-    tuningArgs.setFreq=1590;
+    //tuningArgs.setFreq=1590;
 
     if(tuningArgs.setFreq>0){
         //if freFreq is -1 , abort to use default mode 
@@ -2583,7 +2554,25 @@ setfreq initialization
 
   NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);
 
+  
+#ifdef POWERTUNING_TURING
 
+
+    //info->comm->cudaDev
+    //INFO(NCCL_ALL, "launch cudaLaunchHostFunc at the end of ncclEnqueueCheck on device info->comm->cudaDev %d", info->comm->cudaDev );
+    
+{
+    cudaStream_t deviceStream= info->stream;
+    unsigned long long streamId;
+    cudaError_t err = cudaStreamGetId(deviceStream, &streamId);
+    INFO(NCCL_ALL, "deviceStream ID in info->stream: %llu", streamId);
+    //append reset task to the launchStream here
+    
+    cudaHostFn_t hostfn = &set_streamtask;
+    cudaLaunchHostFunc(deviceStream, hostfn, &info->comm->cudaDev);
+}
+  
+#endif //POWERTUNING_TURING
 
 exit:
   if (devOld != -1) CUDACHECK(cudaSetDevice(devOld));
@@ -2592,6 +2581,31 @@ exit:
   /* if depth is 1, ncclGroupEndInternal() will trigger group ops. The state can change
    * so we have to check state here. */
   if (info->comm && !info->comm->config.blocking) { NCCLCHECK(ncclCommGetAsyncError(info->comm, &ret)) };
+
+
+#ifdef POWERTUNING_TURING
+
+
+    //info->comm->cudaDev
+    INFO(NCCL_ALL, "launch cudaLaunchHostFunc at the end of ncclEnqueueCheck on device info->comm->cudaDev %d", info->comm->cudaDev );
+    
+    //gpuIndex[i]=info->comm->cudaDev;
+    //INFO(NCCL_ALL,"in ncclLaunchFinish, members in tuningArgs_ondevice: setFreq: %d, tuning_ready:%d, payload_size:%d, cudaDevice:%d", tuningArgs_ondevice.setFreq, tuningArgs_ondevice.tuning_ready, tuningArgs_ondevice.payload_size, tuningArgs_ondevice.cudaDevice );
+
+{
+    cudaStream_t deviceStream= info->stream;
+    unsigned long long streamId;
+    cudaError_t err = cudaStreamGetId(deviceStream, &streamId);
+    INFO(NCCL_ALL, "deviceStream ID in info->stream: %llu", streamId);
+    //append reset task to the launchStream here
+    
+    cudaHostFn_t hostfn = &reset_streamtask;
+    cudaLaunchHostFunc(deviceStream, hostfn, &info->comm->cudaDev);
+}
+  
+#endif //POWERTUNING_TURING
+
+
   return ret;
 fail:
   if (info->comm && !info->comm->config.blocking) (void) ncclCommSetAsyncError(info->comm, ret);
