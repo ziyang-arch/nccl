@@ -6,12 +6,13 @@
 
 #include "ipcsocket.h"
 #include "utils.h"
+#include "os.h"
+#include "param.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
-// Enable Linux abstract socket naming
-#define USE_ABSTRACT_SOCKET
+NCCL_PARAM(IpcUseAbstractSocket, "IPC_USE_ABSTRACT_SOCKET", 1);
 
 #define NCCL_IPC_SOCKNAME_STR "/tmp/nccl-socket-%d-%lx"
 
@@ -19,7 +20,7 @@
  * Create a Unix Domain Socket
  */
 ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, volatile uint32_t* abortFlag) {
-  int fd = -1;
+  int fd = NCCL_INVALID_SOCKET;
   struct sockaddr_un cliaddr;
   char temp[NCCL_IPC_SOCKNAME_LEN] = "";
 
@@ -27,7 +28,7 @@ ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, v
     return ncclInternalError;
   }
 
-  handle->fd = -1;
+  handle->fd = NCCL_INVALID_SOCKET;
   handle->socketName[0] = '\0';
   if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
     WARN("UDS: Socket creation error : %s (%d)", strerror(errno), errno);
@@ -41,18 +42,22 @@ ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, v
   int len = snprintf(temp, NCCL_IPC_SOCKNAME_LEN, NCCL_IPC_SOCKNAME_STR, rank, hash);
   if (len > (sizeof(cliaddr.sun_path) - 1)) {
     WARN("UDS: Cannot bind provided name to socket. Name too large");
+    close(fd);
     return ncclInternalError;
   }
-#ifndef USE_ABSTRACT_SOCKET
-  unlink(temp);
-#endif
 
-  TRACE(NCCL_INIT, "UDS: Creating socket %s", temp);
+  int useAbstractSocket = ncclParamIpcUseAbstractSocket();
+  if (!useAbstractSocket) {
+    // For regular Unix domain sockets, unlink any existing socket file
+    (void) unlink(temp);
+  }
 
-  strncpy(cliaddr.sun_path, temp, len);
-#ifdef USE_ABSTRACT_SOCKET
-  cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
-#endif
+  TRACE(NCCL_INIT|NCCL_P2P, "UDS: Creating socket %s%s", temp, useAbstractSocket ? " (abstract)" : "");
+
+  strcpy(cliaddr.sun_path, temp);
+  if (useAbstractSocket) {
+    cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
+  }
   if (bind(fd, (struct sockaddr *)&cliaddr, sizeof(cliaddr)) < 0) {
     WARN("UDS: Binding to socket %s failed : %s (%d)", temp, strerror(errno), errno);
     close(fd);
@@ -66,7 +71,7 @@ ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, v
   // Mark socket as non-blocking
   if (handle->abortFlag) {
     int flags;
-    EQCHECK(flags = fcntl(fd, F_GETFL), -1);
+    SYSCHECK(flags = fcntl(fd, F_GETFL), "fcntl");
     SYSCHECK(fcntl(fd, F_SETFL, flags | O_NONBLOCK), "fcntl");
   }
 
@@ -75,7 +80,7 @@ ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, v
 
 ncclResult_t ncclIpcSocketGetFd(struct ncclIpcSocket* handle, int* fd) {
   if (handle == NULL) {
-    WARN("ncclSocketGetFd: pass NULL socket");
+    WARN("ncclIpcSocketGetFd: pass NULL socket");
     return ncclInvalidArgument;
   }
   if (fd) *fd = handle->fd;
@@ -89,11 +94,10 @@ ncclResult_t ncclIpcSocketClose(ncclIpcSocket *handle) {
   if (handle->fd <= 0) {
     return ncclSuccess;
   }
-#ifndef USE_ABSTRACT_SOCKET
-  if (handle->socketName[0] != '\0') {
-    unlink(handle->socketName);
+  int useAbstractSocket = ncclParamIpcUseAbstractSocket();
+  if (!useAbstractSocket) {
+    (void) unlink(handle->socketName);
   }
-#endif
   close(handle->fd);
 
   return ncclSuccess;
@@ -132,7 +136,7 @@ ncclResult_t ncclIpcSocketRecvMsg(ncclIpcSocket *handle, void *hdr, int hdrLen, 
       WARN("UDS: Receiving data over socket failed : %d", errno);
       return ncclSystemError;
     }
-    if (handle->abortFlag && __atomic_load_n(handle->abortFlag, __ATOMIC_RELAXED)) return ncclInternalError;
+    if (handle->abortFlag && COMPILER_ATOMIC_LOAD(handle->abortFlag, std::memory_order_acquire)) return ncclInternalError;
   }
 
   if (recvFd != NULL) {
@@ -168,7 +172,7 @@ ncclResult_t ncclIpcSocketSendMsg(ncclIpcSocket *handle, void *hdr, int hdrLen, 
   } control_un;
 
   struct cmsghdr *cmptr;
-  char dummy_buffer[1];
+  char dummy_buffer[1] = {'\0'};
   struct sockaddr_un cliaddr;
 
   // Construct client address to send this shareable handle to
@@ -180,17 +184,17 @@ ncclResult_t ncclIpcSocketSendMsg(ncclIpcSocket *handle, void *hdr, int hdrLen, 
     WARN("UDS: Cannot connect to provided name for socket. Name too large");
     return ncclInternalError;
   }
-  (void) strncpy(cliaddr.sun_path, temp, len);
+  strcpy(cliaddr.sun_path, temp);
 
-#ifdef USE_ABSTRACT_SOCKET
-  cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
-#endif
+  int useAbstractSocket = ncclParamIpcUseAbstractSocket();
+  if (useAbstractSocket) {
+    cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
+  }
 
-  TRACE(NCCL_INIT, "UDS: Sending hdr %p len %d to UDS socket %s", hdr, hdrLen, temp);
+  TRACE(NCCL_INIT, "UDS: Sending hdr %p len %d fd %d to UDS socket %s", hdr, hdrLen, sendFd, temp);
 
   if (sendFd != -1) {
-    TRACE(NCCL_INIT, "UDS: Sending fd %d to UDS socket %s", sendFd, temp);
-
+    memset(&control_un, '\0', sizeof(control_un));
     msg.msg_control = control_un.control;
     msg.msg_controllen = sizeof(control_un.control);
 
@@ -221,7 +225,7 @@ ncclResult_t ncclIpcSocketSendMsg(ncclIpcSocket *handle, void *hdr, int hdrLen, 
       WARN("UDS: Sending data over socket %s failed : %s (%d)", temp, strerror(errno), errno);
       return ncclSystemError;
     }
-    if (handle->abortFlag && __atomic_load_n(handle->abortFlag, __ATOMIC_RELAXED)) return ncclInternalError;
+    if (handle->abortFlag && COMPILER_ATOMIC_LOAD(handle->abortFlag, std::memory_order_acquire)) return ncclInternalError;
   }
 
   return ncclSuccess;

@@ -10,9 +10,11 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "checks.h"
+#include "compiler.h"
 
 // Is cuMem API usage enabled
 extern int ncclCuMemEnable();
+extern int ncclCuMemHostEnable();
 
 #if CUDART_VERSION >= 11030
 #include <cudaTypedefs.h>
@@ -20,10 +22,6 @@ extern int ncclCuMemEnable();
 // Handle type used for cuMemCreate()
 extern CUmemAllocationHandleType ncclCuMemHandleType;
 
-#else
-typedef CUresult (CUDAAPI *PFN_cuInit_v2000)(unsigned int Flags);
-typedef CUresult (CUDAAPI *PFN_cuDriverGetVersion_v2020)(int *driverVersion);
-typedef CUresult (CUDAAPI *PFN_cuGetProcAddress_v11030)(const char *symbol, void **pfn, int driverVersion, cuuint64_t flags);
 #endif
 
 #define CUPFN(symbol) pfn_##symbol
@@ -37,6 +35,10 @@ typedef CUresult (CUDAAPI *PFN_cuGetProcAddress_v11030)(const char *symbol, void
       WARN("Cuda failure %d '%s'", err, errStr);	      \
       return ncclUnhandledCudaError;			      \
     }							      \
+} while(false)
+
+#define CUCALL(cmd) do {				      \
+    pfn_##cmd;				                \
 } while(false)
 
 #define CUCHECKGOTO(cmd, res, label) do {		      \
@@ -78,12 +80,16 @@ DECLARE_CUDA_PFN_EXTERN(cuDeviceGetAttribute, 2000);
 DECLARE_CUDA_PFN_EXTERN(cuGetErrorString, 6000);
 DECLARE_CUDA_PFN_EXTERN(cuGetErrorName, 6000);
 DECLARE_CUDA_PFN_EXTERN(cuMemGetAddressRange, 3020);
-DECLARE_CUDA_PFN_EXTERN(cuCtxCreate, 3020);
+DECLARE_CUDA_PFN_EXTERN(cuCtxCreate, 11040);
 DECLARE_CUDA_PFN_EXTERN(cuCtxDestroy, 4000);
 DECLARE_CUDA_PFN_EXTERN(cuCtxGetCurrent, 4000);
 DECLARE_CUDA_PFN_EXTERN(cuCtxSetCurrent, 4000);
 DECLARE_CUDA_PFN_EXTERN(cuCtxGetDevice, 2000);
 DECLARE_CUDA_PFN_EXTERN(cuPointerGetAttribute, 4000);
+DECLARE_CUDA_PFN_EXTERN(cuLaunchKernel, 4000);
+#if CUDART_VERSION >= 11080
+DECLARE_CUDA_PFN_EXTERN(cuLaunchKernelEx, 11060);
+#endif
 // cuMem API support
 DECLARE_CUDA_PFN_EXTERN(cuMemAddressReserve, 10020);
 DECLARE_CUDA_PFN_EXTERN(cuMemAddressFree, 10020);
@@ -96,6 +102,7 @@ DECLARE_CUDA_PFN_EXTERN(cuMemRelease, 10020);
 DECLARE_CUDA_PFN_EXTERN(cuMemRetainAllocationHandle, 11000);
 DECLARE_CUDA_PFN_EXTERN(cuMemSetAccess, 10020);
 DECLARE_CUDA_PFN_EXTERN(cuMemUnmap, 10020);
+DECLARE_CUDA_PFN_EXTERN(cuMemGetAllocationPropertiesFromHandle, 10020);
 #if CUDA_VERSION >= 11070
 DECLARE_CUDA_PFN_EXTERN(cuMemGetHandleForAddressRange, 11070); // DMA-BUF support
 #endif
@@ -108,13 +115,13 @@ DECLARE_CUDA_PFN_EXTERN(cuMulticastCreate, 12010);
 DECLARE_CUDA_PFN_EXTERN(cuMulticastGetGranularity, 12010);
 DECLARE_CUDA_PFN_EXTERN(cuMulticastUnbind, 12010);
 #endif
+/* Stream-MemOp support */
+DECLARE_CUDA_PFN_EXTERN(cuStreamBatchMemOp, 11070);
+DECLARE_CUDA_PFN_EXTERN(cuStreamWaitValue32, 11070);
+DECLARE_CUDA_PFN_EXTERN(cuStreamWaitValue64, 11070);
+DECLARE_CUDA_PFN_EXTERN(cuStreamWriteValue32, 11070);
+DECLARE_CUDA_PFN_EXTERN(cuStreamWriteValue64, 11070);
 #endif
-
-/* CUDA Driver functions loaded with dlsym() */
-DECLARE_CUDA_PFN_EXTERN(cuInit, 2000);
-DECLARE_CUDA_PFN_EXTERN(cuDriverGetVersion, 2020);
-DECLARE_CUDA_PFN_EXTERN(cuGetProcAddress, 11030);
-
 
 ncclResult_t ncclCudaLibraryInit(void);
 
@@ -122,12 +129,15 @@ extern int ncclCudaDriverVersionCache;
 extern bool ncclCudaLaunchBlocking; // initialized by ncclCudaLibraryInit()
 
 inline ncclResult_t ncclCudaDriverVersion(int* driver) {
-  int version = __atomic_load_n(&ncclCudaDriverVersionCache, __ATOMIC_RELAXED);
+  int version = COMPILER_ATOMIC_LOAD(&ncclCudaDriverVersionCache, std::memory_order_relaxed);
   if (version == -1) {
     CUDACHECK(cudaDriverGetVersion(&version));
-    __atomic_store_n(&ncclCudaDriverVersionCache, version, __ATOMIC_RELAXED);
+    COMPILER_ATOMIC_STORE(&ncclCudaDriverVersionCache, version, std::memory_order_relaxed);
   }
   *driver = version;
   return ncclSuccess;
 }
+
+ncclResult_t ncclCuStreamBatchMemOp(cudaStream_t stream, unsigned int numOps, CUstreamBatchMemOpParams* batchParams);
+
 #endif

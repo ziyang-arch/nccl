@@ -12,9 +12,32 @@
 #include "socket.h"
 #include "ipcsocket.h"
 #include "nccl_net.h"
-#include <pthread.h>
-#include "shm.h"
+#include "shmutils.h"
 #include "p2p.h"
+#include "collectives.h"
+#include "gin/gin_host.h"
+
+#include <mutex>
+#include <condition_variable>
+
+typedef enum : uint8_t {
+  ncclPatternRing,
+  ncclPatternRingTwice,
+  ncclPatternPipelineFrom,
+  ncclPatternPipelineTo,
+  ncclPatternTreeUp,
+  ncclPatternTreeDown,
+  ncclPatternTreeUpDown,
+  ncclPatternCollnetChain,
+  ncclPatternCollnetDirect,
+  ncclPatternNvls,
+  ncclPatternNvlsTree,
+  ncclPatternPatUp,
+  ncclPatternPatDown,
+  ncclPatternSend,
+  ncclPatternRecv,
+  ncclPatternProfiler,
+} ncclPattern_t;
 
 enum ncclProxyOpState { ncclProxyOpNone, ncclProxyOpReady, ncclProxyOpProgress };
 
@@ -22,49 +45,102 @@ struct ncclProxyArgs;
 typedef ncclResult_t (*proxyProgressFunc_t)(struct ncclProxyState*, struct ncclProxyArgs*);
 
 #define NCCL_PROXY_MAX_SUBS MAXCHANNELS
-static_assert(NCCL_MAX_WORK_ELEMENTS <= MAXCHANNELS, "Not enough sub space for max work elements");
+static_assert(2*NCCL_MAX_DEV_WORK_P2P_PER_BATCH <= MAXCHANNELS, "Not enough sub space for max work elements");
 
 union ncclProxyOpSpecifics {
   struct {
     size_t sizePerRank;
     int nNodes, node;
   } collnetDirect;
+  struct {
+    int sendSlices;
+    int recvSlices;
+    int stepSize;
+  } bcast;
 };
 
 struct ncclProxyOp {
   struct ncclProxyConnection* connection;
-  void* buffer;
   ssize_t nbytes;
   uint64_t opCount;
   int root;
   int next;
   int nsteps;
-  int chunkSize;
+  size_t chunkSize;
+  size_t sliceSize;
+  size_t loopSize;
+  size_t loopOffset;
+  size_t channelSize;
   uint8_t sliceSteps;
   uint8_t chunkSteps;
   uint8_t channelId;
   uint8_t /*ncclDataType_t*/ dtype;
   uint8_t /*ncclDevRedOp_t*/ redOp;
   uint8_t /*ncclFunc_t*/ coll;
+  uint8_t /*ncclFunc_t*/ collAPI;
   uint8_t /*ncclPattern_t*/ pattern;
   uint8_t protocol;
+  uint8_t algorithm;
   uint8_t reg;
-
+  // collnet/p2p/coll buffer reg handles
+  void* sendMhandle;
+  void* recvMhandle;
+  uint8_t* sendbuff;
+  uint8_t* recvbuff;
+  int isOneRPN;
+  RingAlgorithm *ringAlgo;
   union ncclProxyOpSpecifics specifics;
+  int nChannels;
+  int nPeers;
+
+  // Profiler plugin
+  union {
+    struct ncclTaskColl* coll;
+    struct ncclTaskP2p* p2p;
+  } task;
+
+  // Profiler work counter increment flag. Set to 'true' if the profiler work counter for this channel needs increment.
+  // Always 'true' for collective operations. Grouped p2p operations are fused into one <send, recv> pair in the GPU kernel,
+  // meaning the GPU profiler code increments the work counter for the pair rather than the individual p2p. For this
+  // reason, the incWorkCounter flag is used to avoid incrementing the work counter twice in the host code. This is done
+  // by setting incWorkCounter to 'true' only for one of the p2ps in the pair during enqueue.
+  bool incWorkCounter;
+  int eActivationMask;
+  void* taskEventHandle;
+  int rank;
+  int peer;
+  pid_t pid;
+  void* profilerContext;
+  uint64_t workCounter;
 
   struct ncclProxyOp *enqNext;
+};
+
+struct ncclProxySubArgs;
+
+struct ncclProxyEventHandle {
+  void* stepEventHandle;
+  struct ncclProxySubArgs* subArgPtr;
 };
 
 struct ncclProxySubArgs {
   struct ncclProxyConnection* connection;
   int reg;
-  void* buffer;
-  void* mhandle;
+  // collnet handles
+  void* sendMhandle;
+  void* recvMhandle;
+  uint8_t* sendbuff;
+  uint8_t* recvbuff;
+  size_t offset;
+  ssize_t loopSize;
+  ssize_t loopOffset;
   int channelId;
   int nsteps;
   ssize_t nbytes;
+  ssize_t chunkSize;
   int peer;
-
+  int isOneRPN;
+  RingAlgorithm *ringAlgo;
   int groupSize; // Number of consecutive sub operations sharing the same recvComm
   uint64_t base;
   uint64_t posted;
@@ -73,8 +149,21 @@ struct ncclProxySubArgs {
   uint64_t transmitted;
   uint64_t done;
   uint64_t end;
+  int regBufferReady;
   void* requests[NCCL_STEPS];
-  void* profilingEvents[NCCL_STEPS];
+
+  // Profiler plugin
+  int eActivationMask;
+  int rank;
+  pid_t pid;
+  void* profilerContext;
+  void* taskEventHandle;
+  void* opEventHandle;
+  void* kernelEventHandle;
+  struct ncclProxyEventHandle pHandles[NCCL_STEPS];
+  size_t transSize;
+  uint64_t workCounter;
+
   void* recvRequestsCache[NCCL_STEPS];
   int recvRequestsSubCount;
 };
@@ -84,18 +173,27 @@ struct ncclProxyArgs {
   proxyProgressFunc_t progress;
   int nsubs;
   int done;
+  int onePPN;
   uint64_t opCount;
   int sliceSteps;
   int chunkSteps;
-  int chunkSize;
+  size_t chunkSize;
+  size_t totalSendSize;
+  size_t totalRecvSize;
+  size_t sendSizePerRound;
+  size_t recvSizePerRound;
   uint8_t /*ncclDataType_t*/ dtype;
   uint8_t /*ncclDevRedOp_t*/ redOp;
   uint8_t /*ncclPattern_t*/ pattern;
   uint8_t /*ncclFunc_t*/ coll;
+  uint8_t /*ncclFunc_t*/ collAPI;
   uint8_t protocol;
+  uint8_t algorithm;
   int state;
   char* sharedBuff[NCCL_STEPS];
   int sharedSize[NCCL_STEPS];
+  int nChannels;
+  int nPeers;
 
   int idle;
 
@@ -110,16 +208,17 @@ struct ncclProxyArgs {
 
 // ProxyOps are used to communicate between main thread and service thread
 // Make sure we have enough to store two full rounds of operations on all channels.
-// Otherwise we'd be unable to post half of them to free new elements.
-#define MAX_OPS_PER_PEER (2*MAXCHANNELS*NCCL_MAX_WORK_ELEMENTS_P2P)
+// Otherwise we'd be unable to post half of them to free new elements. Each
+// p2p work contains a send and recv proxy op hence the 2x before it.
+#define MAX_OPS_PER_PEER (2*MAXCHANNELS*2*NCCL_MAX_DEV_WORK_P2P_PER_BATCH)
 
 struct ncclProxyOpsPool {
   struct ncclProxyOp ops[MAX_OPS_PER_PEER*NCCL_MAX_LOCAL_RANKS];
   volatile int nextOps;
   volatile int nextOpsEnd;
   volatile int freeOps[NCCL_MAX_LOCAL_RANKS];
-  pthread_mutex_t mutex;
-  pthread_cond_t cond;
+  std::mutex mutex;
+  std::condition_variable cond;
 };
 
 struct ncclProxyOps {
@@ -147,6 +246,8 @@ struct ncclProxyPeer {
 };
 
 struct ncclSharedNetComms {
+  int activeConnect[MAXCHANNELS];
+  int activeAccept[MAXCHANNELS];
   void* sendComm[MAXCHANNELS];
   void* recvComm[MAXCHANNELS];
   int sendRefCount[MAXCHANNELS];
@@ -160,7 +261,7 @@ struct ncclProxyProgressState {
   ncclShmHandle_t handle;
   char opsPoolShmSuffix[6];
 
-  pthread_t thread;
+  std::thread thread;
   volatile int stop;
   struct ncclProxyPeer** localPeers;
   struct ncclSharedNetComms* netComms[NCCL_MAX_NETDEVS];
@@ -229,10 +330,13 @@ struct ncclProxyState {
   bool dmaBufSupport;
   ncclNet_t* ncclNet;
   ncclCollNet_t* ncclCollNet;
-  volatile uint32_t* abortFlag;
+  struct ncclGinState* ginState;
+
+  uint32_t* abortFlag;
+  bool directMode;
   // Service threads
-  pthread_t thread;
-  pthread_t threadUDS;
+  std::thread thread;
+  std::thread threadUDS;
   struct ncclSocket* listenSock;
   struct ncclIpcSocket ipcSock;
   int stop;
@@ -249,6 +353,14 @@ struct ncclProxyState {
 
   // Progress thread
   struct ncclProxyProgressState progressState;
+
+  // Network plugin
+  void* netContext;
+  ncclNetAttr_t netAttr;
+  void* collNetContext;
+
+  // Profiler plugin
+  void* profilerContext;
 
   // Queue of expected responses from the proxy
   struct ncclExpectedProxyResponse* expectedResponses;
@@ -287,11 +399,12 @@ enum proxyMode {
 };
 
 ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* proxyOp, bool *justInquire);
-ncclResult_t ncclProxyComputeP2p(struct ncclInfo* info, struct ncclProxyOp* proxyOp, int reg);
 ncclResult_t ncclProxyStart(struct ncclComm* comm);
 ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses, uint64_t *peerAddressesUDS);
 ncclResult_t ncclProxyCreate(struct ncclComm* comm);
 ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int proxyRank, struct ncclProxyConnector* proxyConn);
+
+// NB: ncclProxyMsgTypeStr[] in proxy.cc needs to match
 enum ncclProxyMsgType {
   ncclProxyMsgInit = 1,
   ncclProxyMsgSharedInit = 2,
@@ -302,6 +415,9 @@ enum ncclProxyMsgType {
   ncclProxyMsgAbort = 7,
   ncclProxyMsgStop = 8,
   ncclProxyMsgGetFd = 9, // cuMem API support (UDS)
+  ncclProxyMsgQueryFd = 10,
+  ncclProxyMsgRegister = 11,
+  ncclProxyMsgDeregister = 12
 };
 
 // This function is called by a client of the proxy that needs to invoke any of the non-progress proxyOp types
@@ -315,6 +431,8 @@ ncclResult_t ncclPollProxyResponse(struct ncclComm* comm, struct ncclProxyConnec
 
 // UDS support
 ncclResult_t ncclProxyClientGetFdBlocking(struct ncclComm* comm, int rank, void *handle, int* convertedFd);
+ncclResult_t ncclProxyClientQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int localFd, int* rmtFd);
+ncclResult_t ncclProxyClientBatchQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int* localFds, int* rmtFds, int numSegments);
 
 ncclResult_t ncclProxyStop(struct ncclComm* comm);
 ncclResult_t ncclProxyShmUnlink(struct ncclComm* comm);

@@ -25,9 +25,18 @@ ncclResult_t CudaPtrCheck(const void* pointer, struct ncclComm* comm, const char
   return ncclSuccess;
 }
 
-ncclResult_t PtrCheck(void* ptr, const char* opname, const char* ptrname) {
+ncclResult_t PtrCheck(const void* ptr, const char* opname, const char* ptrname) {
   if (ptr == NULL) {
     WARN("%s : %s argument is NULL", opname, ptrname);
+    return ncclInvalidArgument;
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t CommCheck(struct ncclComm* comm, const char* opname, const char* ptrname) {
+  NCCLCHECK(PtrCheck(comm, opname, ptrname));
+  if (comm->startMagic != NCCL_MAGIC || comm->endMagic != NCCL_MAGIC) {
+    WARN("Error: corrupted comm object detected");
     return ncclInvalidArgument;
   }
   return ncclSuccess;
@@ -43,9 +52,11 @@ ncclResult_t ArgsCheck(struct ncclInfo* info) {
     WARN("%s : invalid type %d", info->opName, info->datatype);
     return ncclInvalidArgument;
   }
-  // Type is OK, compute nbytes. Convert Allgather/Broadcast/P2P calls to chars.
-  NCCLCHECK(ncclInfoSetDerived(info, info->comm->nRanks));
 
+  // ncclMaxRedOp < info->op will always be false due to the sizes of
+  // the datatypes involved, and that's by design.  We keep the check though
+  // just as a reminder.
+  // coverity[result_independent_of_operands]
   if (info->op < 0 || ncclMaxRedOp < info->op) {
     WARN("%s : invalid reduction operation %d", info->opName, info->op);
     return ncclInvalidArgument;

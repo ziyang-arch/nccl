@@ -253,6 +253,57 @@ typedef nvmlGpuFabricInfo_v2_t nvmlGpuFabricInfoV_t;
 */
 #define nvmlGpuFabricInfo_v2 NVML_STRUCT_VERSION(GpuFabricInfo, 2)
 
+/**
+ * Structure to store platform information (v2)
+ */
+typedef struct
+{
+    unsigned int version;                       //!< the API version number
+    unsigned char ibGuid[16];                   //!< Infiniband GUID reported by platform (for Blackwell, ibGuid is 8 bytes so indices 8-15 are zero)
+    unsigned char chassisSerialNumber[16];      //!< Serial number of the chassis containing this GPU (for Blackwell it is 13 bytes so indices 13-15 are zero)
+    unsigned char slotNumber;                   //!< The slot number in the chassis containing this GPU (includes switches)
+    unsigned char trayIndex;                    //!< The tray index within the compute slots in the chassis containing this GPU (does not include switches)
+    unsigned char hostId;                       //!< Index of the node within the slot containing this GPU
+    unsigned char peerType;                     //!< Platform indicated NVLink-peer type (e.g. switch present or not)
+    unsigned char moduleId;                     //!< ID of this GPU within the node
+} nvmlPlatformInfo_v2_t;
+
+typedef nvmlPlatformInfo_v2_t nvmlPlatformInfo_t;
+#define nvmlPlatformInfo_v2 NVML_STRUCT_VERSION(PlatformInfo, 2)
+
+/**
+ * Confidential Compute Feature Status values
+ */
+#define NVML_CC_SYSTEM_FEATURE_DISABLED 0
+#define NVML_CC_SYSTEM_FEATURE_ENABLED  1
+
+typedef struct nvmlConfComputeSystemState_st {
+    unsigned int environment;
+    unsigned int ccFeature;
+    unsigned int devToolsMode;
+} nvmlConfComputeSystemState_t;
+
+/**
+ * Confidential Compute Multigpu mode values
+ */
+#define NVML_CC_SYSTEM_MULTIGPU_NONE 0
+#define NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE 1
+#define NVML_CC_SYSTEM_MULTIGPU_NVLE 2
+
+/**
+ * Confidential Compute System settings
+ */
+typedef struct {
+    unsigned int version;
+    unsigned int environment;
+    unsigned int ccFeature;
+    unsigned int devToolsMode;
+    unsigned int multiGpuMode;
+} nvmlSystemConfComputeSettings_v1_t;
+
+typedef nvmlSystemConfComputeSettings_v1_t nvmlSystemConfComputeSettings_t;
+#define nvmlSystemConfComputeSettings_v1 NVML_STRUCT_VERSION(SystemConfComputeSettings, 1)
+
 /* End of nvml.h */
 #endif // NCCL_NVML_DIRECT
 
@@ -267,6 +318,12 @@ struct ncclNvmlDevicePairInfo {
 extern int ncclNvmlDeviceCount;
 extern ncclNvmlDeviceInfo ncclNvmlDevices[ncclNvmlMaxDevices];
 extern ncclNvmlDevicePairInfo ncclNvmlDevicePairs[ncclNvmlMaxDevices][ncclNvmlMaxDevices];
+
+struct ncclNvmlCCStatus {
+    bool CCEnabled;
+    bool multiGpuProtectedPCIE;
+    bool multiGpuNVLE;
+};
 
 // All ncclNvmlFoo() functions call ncclNvmlEnsureInitialized() implicitly.
 // Outsiders need only call it if they want to inspect the ncclNvml global
@@ -283,5 +340,7 @@ ncclResult_t ncclNvmlDeviceGetCudaComputeCapability(nvmlDevice_t device, int* ma
 ncclResult_t ncclNvmlDeviceGetP2PStatus(nvmlDevice_t device1, nvmlDevice_t device2, nvmlGpuP2PCapsIndex_t p2pIndex, nvmlGpuP2PStatus_t* p2pStatus);
 ncclResult_t ncclNvmlDeviceGetFieldValues(nvmlDevice_t device, int valuesCount, nvmlFieldValue_t *values);
 ncclResult_t ncclNvmlDeviceGetGpuFabricInfoV(nvmlDevice_t device, nvmlGpuFabricInfoV_t *gpuFabricInfo);
+ncclResult_t ncclNvmlDeviceGetPlatformInfo(nvmlDevice_t device, nvmlPlatformInfo_t *plaformInfo);
+ncclResult_t ncclNvmlGetCCStatus(struct ncclNvmlCCStatus *status);
 
 #endif // End include guard

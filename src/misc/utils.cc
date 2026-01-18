@@ -6,18 +6,20 @@
 
 #include "utils.h"
 #include "core.h"
+#include "os.h"
 
 #include "nvmlwrap.h"
 
 #include <stdlib.h>
+#include <mutex>
 
 // Get current Compute Capability
 int ncclCudaCompCap() {
   int cudaDev;
-  if (cudaGetDevice(&cudaDev) != cudaSuccess) return 0;
+  if (!CUDASUCCESS(cudaGetDevice(&cudaDev))) return 0;
   int ccMajor, ccMinor;
-  if (cudaDeviceGetAttribute(&ccMajor, cudaDevAttrComputeCapabilityMajor, cudaDev) != cudaSuccess) return 0;
-  if (cudaDeviceGetAttribute(&ccMinor, cudaDevAttrComputeCapabilityMinor, cudaDev) != cudaSuccess) return 0;
+  if (!CUDASUCCESS(cudaDeviceGetAttribute(&ccMajor, cudaDevAttrComputeCapabilityMajor, cudaDev))) return 0;
+  if (!CUDASUCCESS(cudaDeviceGetAttribute(&ccMinor, cudaDevAttrComputeCapabilityMinor, cudaDev))) return 0;
   return ccMajor*10+ccMinor;
 }
 
@@ -65,15 +67,7 @@ ncclResult_t getHostName(char* hostname, int maxlen, const char delim) {
   return ncclSuccess;
 }
 
-uint64_t getHash(const char* string, int n) {
-  // Based on DJB2a, result = result * 33 ^ char
-  uint64_t result = 5381;
-  for (int c = 0; c < n; c++) {
-    result = ((result << 5) + result) ^ string[c];
-  }
-  return result;
-}
-
+static uint64_t hostHashValue = 0;
 /* Generate a hash of the unique identifying string for this host
  * that will be unique for both bare-metal and container instances
  * Equivalent of a hash of;
@@ -83,7 +77,7 @@ uint64_t getHash(const char* string, int n) {
  * This string can be overridden by using the NCCL_HOSTID env var.
  */
 #define HOSTID_FILE "/proc/sys/kernel/random/boot_id"
-uint64_t getHostHash(void) {
+static void getHostHashOnce() {
   char hostHash[1024];
   const char *hostId;
 
@@ -93,7 +87,8 @@ uint64_t getHostHash(void) {
 
   if ((hostId = ncclGetEnv("NCCL_HOSTID")) != NULL) {
     INFO(NCCL_ENV, "NCCL_HOSTID set by environment to %s", hostId);
-    strncpy(hostHash, hostId, sizeof(hostHash));
+    strncpy(hostHash, hostId, sizeof(hostHash)-1);
+    hostHash[sizeof(hostHash)-1] = '\0';
   } else {
     FILE *file = fopen(HOSTID_FILE, "r");
     if (file != NULL) {
@@ -102,8 +97,8 @@ uint64_t getHostHash(void) {
         strncpy(hostHash+offset, p, sizeof(hostHash)-offset-1);
         free(p);
       }
+      fclose(file);
     }
-    fclose(file);
   }
 
   // Make sure the string is terminated
@@ -111,7 +106,19 @@ uint64_t getHostHash(void) {
 
   TRACE(NCCL_INIT,"unique hostname '%s'", hostHash);
 
-  return getHash(hostHash, strlen(hostHash));
+  hostHashValue = getHash(hostHash, strlen(hostHash));
+}
+uint64_t getHostHash(void) {
+  static std::once_flag once;
+  std::call_once(once, getHostHashOnce);
+  return hostHashValue;
+}
+
+uint64_t hashCombine(uint64_t baseHash, uint64_t value) {
+  uint64_t hacc[2] = {1, 1};
+  eatHash(hacc, &baseHash);
+  eatHash(hacc, &value);
+  return digestHash(hacc);
 }
 
 /* Generate a hash of the unique identifying string for this process
@@ -123,7 +130,7 @@ uint64_t getHostHash(void) {
 uint64_t getPidHash(void) {
   char pname[1024];
   // Start off with our pid ($$)
-  sprintf(pname, "%ld", (long) getpid());
+  sprintf(pname, "%ld", (long) ncclOsGetpid());
   int plen = strlen(pname);
   int len = readlink("/proc/self/ns/pid", pname+plen, sizeof(pname)-1-plen);
   if (len < 0) len = 0;
@@ -193,7 +200,7 @@ bool matchIfList(const char* string, int port, struct netIf* ifList, int listSiz
   return false;
 }
 
-__thread struct ncclThreadSignal ncclThreadSignalLocalInstance = ncclThreadSignalStaticInitializer();
+thread_local struct ncclThreadSignal ncclThreadSignalLocalInstance;
 
 void* ncclMemoryStack::allocateSpilled(struct ncclMemoryStack* me, size_t size, size_t align) {
   // `me->hunks` points to the top of the stack non-empty hunks. Hunks above
@@ -292,78 +299,251 @@ void ncclMemoryStackDestruct(struct ncclMemoryStack* me) {
   }
 }
 
-const char* ncclOpToString(ncclRedOp_t op) {
-  switch (op) {
-    case ncclSum:
-      return "ncclSum";
-    case ncclProd:
-      return "ncclProd";
-    case ncclMax:
-      return "ncclMax";
-    case ncclMin:
-      return "ncclMin";
-    case ncclAvg:
-      return "ncclAvg";
-    default:
-      return "Unknown";
+/* return concatenated string representing each set bit */
+ncclResult_t ncclBitsToString(uint32_t bits, uint32_t mask, const char* (*toStr)(int), char *buf, size_t bufLen, const char *wildcard) {
+  if (!buf || !bufLen)
+    return ncclInvalidArgument;
+
+  bits &= mask;
+
+  // print wildcard value if all bits set
+  if (wildcard && bits == mask) {
+    snprintf(buf, bufLen, "%s", wildcard);
+    return ncclSuccess;
   }
+
+  // Add each set bit to string
+  int pos = 0;
+  for (int i = 0; bits; i++, bits >>= 1) {
+    if (bits & 1) {
+      if (pos > 0) pos += snprintf(buf + pos, bufLen - pos, "|");
+      pos += snprintf(buf + pos, bufLen - pos, "%s", toStr(i));
+    }
+  }
+
+  return ncclSuccess;
 }
 
-const char* ncclDatatypeToString(ncclDataType_t type) {
-  switch (type) {
-    case ncclInt8: // ncclChar
-      return "ncclInt8";
-    case ncclInt32: // ncclInt
-      return "ncclInt32";
-    case ncclUint32:
-      return "ncclUint32";
-    case ncclInt64:
-      return "ncclInt64";
-    case ncclUint64:
-      return "ncclUint64";
-    case ncclFloat16: // ncclHalf
-      return "ncclFloat16";
-    case ncclFloat32: // ncclFloat
-      return "ncclFloat32";
-    case ncclFloat64: // ncclDouble
-      return "ncclFloat64";
-#if defined(__CUDA_BF16_TYPES_EXIST__)
-    case ncclBfloat16:
-      return "ncclBfloat16";
-#endif
-    default:
-      return "Unknown";
-  }
+////////////////////////////////////////////////////////////////////////////////
+// Hash function for pointer types (shared by address map implementations)
+// Uses shadowpool's algorithm
+uint64_t ncclHashPointer(int hbits, void* key) {
+  uintptr_t h = reinterpret_cast<uintptr_t>(key);
+  h ^= h>>32;
+  h *= 0x9e3779b97f4a7c13;
+  return (uint64_t)h >> (64-hbits);
 }
 
-const char* ncclAlgoToString(int algo) {
-  switch (algo) {
-    case NCCL_ALGO_TREE:
-      return "TREE";
-    case NCCL_ALGO_RING:
-      return "RING";
-    case NCCL_ALGO_COLLNET_DIRECT:
-      return "COLLNET_DIRECT";
-    case NCCL_ALGO_COLLNET_CHAIN:
-      return "COLLNET_CHAIN";
-    case NCCL_ALGO_NVLS:
-      return "NVLS";
-    case NCCL_ALGO_NVLS_TREE:
-      return "NVLS_TREE";
-    default:
-      return "Unknown";
-  }
+////////////////////////////////////////////////////////////////////////////////
+// Intrusive address map implementation (untyped core functions)
+
+// Helper: Read key from object at given offset
+// Key must be convertible to uintptr_t, so we read keySize bytes and zero-extend
+static inline uintptr_t readKey(void* object, int keySize, int keyFieldOffset) {
+  void* keyPtr = (char*)object + keyFieldOffset;
+  uintptr_t result = 0;
+  memcpy(&result, keyPtr, keySize);
+  return result;
 }
 
-const char* ncclProtoToString(int proto) {
-  switch (proto) {
-    case NCCL_PROTO_LL:
-      return "LL";
-    case NCCL_PROTO_LL128:
-      return "LL128";
-    case NCCL_PROTO_SIMPLE:
-      return "SIMPLE";
-    default:
-      return "Unknown";
+// Helper: Read next pointer from object at given offset
+// Uses memcpy to avoid strict aliasing violations when actual type is T*, not void*
+static inline void* readNextPtr(void* object, int nextFieldOffset) {
+  void* nextPtr = (char*)object + nextFieldOffset;
+  void* result = nullptr;
+  memcpy(&result, nextPtr, sizeof(void*));
+  return result;
+}
+
+// Helper: Write next pointer to object at given offset
+// Uses memcpy to avoid strict aliasing violations when actual type is T*, not void*
+static inline void writeNextPtr(void* object, int nextFieldOffset, void* value) {
+  void* nextPtr = (char*)object + nextFieldOffset;
+  memcpy(nextPtr, &value, sizeof(void*));
+}
+
+ncclResult_t ncclIntruAddressMapInsert_untyped(
+    struct ncclIntruAddressMap_untyped* map,
+    int keySize, int keyFieldOffset, int nextFieldOffset,
+    uintptr_t key, void* object) {
+  // Runtime validation
+  if (map == nullptr) {
+    WARN("Intrusive address map pointer is NULL");
+    return ncclInvalidUsage;
   }
+  if (object == nullptr) {
+    WARN("Object pointer is NULL");
+    return ncclInvalidUsage;
+  }
+  if (keySize <= 0 || keySize > (int)sizeof(uintptr_t)) {
+    WARN("Invalid key size %d (must be 0 < keySize <= %zu)", keySize, sizeof(uintptr_t));
+    return ncclInvalidUsage;
+  }
+
+  // Lazy initialization - create table on first insert
+  if (map->hbits == 0) {
+    map->hbits = 4;
+    map->table = (void**)calloc(1<<map->hbits, sizeof(void*));
+    if (map->table == nullptr) {
+      map->hbits = 0; // Reset on failure
+      WARN("Intrusive address map initialization failed: calloc(%d entries) returned null", 1<<map->hbits);
+      return ncclSystemError;
+    }
+  }
+
+  int hbits = map->hbits;
+
+  // Check for address map size increase before inserting. Maintain 2:1 object:bucket ratio.
+  if (map->count+1 > 2<<hbits) {
+    int oldHbits = hbits;
+    int oldSize = 1<<oldHbits;
+    int newHbits = hbits + 1;
+    int newSize = 1<<newHbits;
+
+    // Allocate a new table (don't use realloc to avoid data corruption during rehashing)
+    void** newTable = (void**)malloc(newSize * sizeof(void*));
+    if (newTable == nullptr) {
+      WARN("Intrusive address map resize failed: malloc(%d entries) returned null", newSize);
+      return ncclSystemError;
+    }
+
+    // Initialize all new buckets to nullptr
+    for (int i = 0; i < newSize; i++) {
+      newTable[i] = nullptr;
+    }
+
+    // Rehash all existing entries from old table to new table
+    for (int i = 0; i < oldSize; i++) {
+      void* obj = map->table[i];
+
+      while (obj) {
+        void* next = readNextPtr(obj, nextFieldOffset);
+        uintptr_t objKey = readKey(obj, keySize, keyFieldOffset);
+        uint64_t b = ncclHashPointer(newHbits, (void*)objKey);
+        writeNextPtr(obj, nextFieldOffset, newTable[b]);
+        newTable[b] = obj;
+        obj = next;
+      }
+    }
+
+    // Free old table and update to new table
+    free(map->table);
+    map->table = newTable;
+    map->hbits = newHbits;
+  }
+
+  // Insert object into appropriate bucket
+  uint64_t b = ncclHashPointer(map->hbits, (void*)key);
+  void* currentNext = readNextPtr(object, nextFieldOffset);
+
+  // Check if next pointer is already non-NULL (object might already be in a list)
+  if (currentNext != nullptr) {
+    INFO(NCCL_INIT, "Intrusive map: inserting object %p with non-NULL next pointer %p (key=0x%lx). "
+         "Object may already be in another list or this is intentional reuse.",
+         object, currentNext, (unsigned long)key);
+  }
+
+  writeNextPtr(object, nextFieldOffset, map->table[b]);
+  map->table[b] = object;
+  map->count += 1;
+
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIntruAddressMapFind_untyped(
+    struct ncclIntruAddressMap_untyped* map,
+    int keySize, int keyFieldOffset, int nextFieldOffset,
+    uintptr_t key, void** object) {
+  // Runtime validation
+  if (map == nullptr) {
+    WARN("Intrusive address map pointer is NULL");
+    return ncclInvalidUsage;
+  }
+  if (object == nullptr) {
+    WARN("Output object pointer is NULL");
+    return ncclInvalidUsage;
+  }
+  if (keySize <= 0 || keySize > (int)sizeof(uintptr_t)) {
+    WARN("Invalid key size %d (must be 0 < keySize <= %zu)", keySize, sizeof(uintptr_t));
+    return ncclInvalidUsage;
+  }
+
+  *object = nullptr;
+
+  // Empty map is not an error - just means key not found
+  if (map->hbits == 0) {
+    return ncclSuccess;
+  }
+
+  uint64_t b = ncclHashPointer(map->hbits, (void*)key);
+  void* obj = map->table[b];
+
+  while (obj) {
+    uintptr_t objKey = readKey(obj, keySize, keyFieldOffset);
+    if (objKey == key) {
+      *object = obj;
+      return ncclSuccess;
+    }
+    obj = readNextPtr(obj, nextFieldOffset);
+  }
+
+  // Key not found is not an error - *object is already nullptr
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIntruAddressMapRemove_untyped(
+    struct ncclIntruAddressMap_untyped* map,
+    int keySize, int keyFieldOffset, int nextFieldOffset,
+    uintptr_t key) {
+  // Runtime validation
+  if (map == nullptr) {
+    WARN("Intrusive address map pointer is NULL");
+    return ncclInvalidUsage;
+  }
+  if (keySize <= 0 || keySize > (int)sizeof(uintptr_t)) {
+    WARN("Invalid key size %d (must be 0 < keySize <= %zu)", keySize, sizeof(uintptr_t));
+    return ncclInvalidUsage;
+  }
+
+  // Removing from empty map is not an error - it's idempotent
+  if (map->hbits == 0) {
+    return ncclSuccess;
+  }
+
+  uint64_t b = ncclHashPointer(map->hbits, (void*)key);
+  void* prev = nullptr;
+  void* obj = map->table[b];
+
+  while (obj) {
+    uintptr_t objKey = readKey(obj, keySize, keyFieldOffset);
+    if (objKey == key) {
+      void* next = readNextPtr(obj, nextFieldOffset);
+
+      // Update the previous pointer to skip the current object
+      if (prev == nullptr) {
+        // Removing from head of bucket
+        map->table[b] = next;
+      } else {
+        // Removing from middle/end of list
+        writeNextPtr(prev, nextFieldOffset, next);
+      }
+
+      map->count -= 1;
+
+      // If this was the last entry, clean up the table (same pattern as non-intrusive map)
+      if (map->count == 0) {
+        free(map->table);
+        map->hbits = 0;
+        map->count = 0;
+        map->table = nullptr;
+      }
+
+      return ncclSuccess;
+    }
+    prev = obj;
+    obj = readNextPtr(obj, nextFieldOffset);
+  }
+
+  // Key not found is not an error - remove is idempotent
+  return ncclSuccess;
 }

@@ -8,17 +8,27 @@
 #include "info.h"
 #include "collectives.h"
 #include "socket.h"
-#include "shm.h"
-#include "profiler.h"
+#include "shmutils.h"
 #define ENABLE_TIMER 0
 #include "timer.h"
+#include "profiler.h"
+#include "transport.h"
+#include "cpuset.h"
+#include "compiler.h"
+#include "os.h"
 
 #include <sys/syscall.h>
 #include <assert.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sched.h>
+#include <algorithm>
+#include <mutex>
+
+#define NCCL_MAX_PROXY_CONNECTIONS (NCCL_MAX_LOCAL_RANKS+1)
 
 enum { proxyRecv=0, proxySend=1 };
+void* ncclProxyServiceUDS(void* _args);
 
 static bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks) {
   if (pattern == ncclPatternRing || pattern == ncclPatternRingTwice) return true;
@@ -66,8 +76,10 @@ static ncclResult_t expectedProxyResponseStore(struct ncclProxyState* state, voi
         return ncclInternalError;
       }
 
-      memcpy(elem->respBuff, respBuff, respSize);
-      free(respBuff);
+      if (respSize > 0) {
+        memcpy(elem->respBuff, respBuff, respSize);
+        free(respBuff);
+      }
       elem->done = true;
       elem->res  = res;
       return ncclSuccess;
@@ -358,11 +370,28 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
   sub->channelId = op->channelId;
   sub->nsteps = op->nsteps;
   sub->nbytes = op->nbytes;
-  sub->peer = op->root;
+  sub->chunkSize = op->chunkSize;
+  sub->offset = 0;
+  sub->loopSize = op->loopSize;
+  sub->loopOffset = op->loopOffset;
+  sub->isOneRPN = op->isOneRPN;
+  sub->peer = op->peer;
   sub->reg = op->reg;
-  sub->buffer = op->buffer;
+  sub->sendMhandle = op->sendMhandle;
+  sub->recvMhandle = op->recvMhandle;
+  sub->sendbuff = op->sendbuff;
+  sub->recvbuff = op->recvbuff;
+  sub->eActivationMask = op->eActivationMask;
+  sub->taskEventHandle = op->taskEventHandle;
+  sub->rank = op->rank;
+  sub->pid = op->pid;
+  sub->profilerContext = op->profilerContext;
+  sub->ringAlgo = op->ringAlgo;
+  sub->workCounter = op->workCounter;
   args->nsubs = subIndex+1;
   if (subIndex) {
+    args->nChannels = std::min(args->nChannels, op->nChannels);
+    args->nPeers = std::min(args->nPeers, op->nPeers);
     if ((args->sliceSteps != op->sliceSteps) ||
         (args->chunkSteps != op->chunkSteps) ||
         (args->protocol != op->protocol) ||
@@ -376,7 +405,7 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
       WARN("Proxy append on running operation");
       return ncclInternalError;
     }
-    return ncclSuccess;
+    goto exit;
   }
   //memset(&args->progress, 0, sizeof(struct ncclProxyArgs)-offsetof(struct ncclProxyArgs, progress));
   args->done = 0;
@@ -389,10 +418,16 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
   args->pattern = op->pattern;
   args->protocol = op->protocol;
   args->coll = op->coll;
+  args->collAPI = op->collAPI;
+  args->algorithm = op->algorithm;
+  args->nChannels = op->nChannels;
+  args->nPeers = op->nPeers;
   args->specifics = op->specifics;
   args->state = ncclProxyOpReady;
   args->progress = op->connection->tcomm->proxyProgress;
   args->proxyAppendPtr = op->connection->proxyAppendPtr;
+exit:
+  if (args->pattern != ncclPatternProfiler) ncclProfilerStartProxyOpEvent(subIndex, args);
   return ncclSuccess;
 }
 
@@ -434,15 +469,14 @@ static ncclResult_t ProxyAppend(struct ncclProxyProgressState* state, struct ncc
 }
 
 ncclResult_t ncclProxyPost(struct ncclProxyOpsPool* pool, int nextOps, int nextOpsEnd) {
-  pthread_mutex_lock(&pool->mutex);
+  std::lock_guard<std::mutex> lock(pool->mutex);
   if (pool->nextOps == -1) {
     pool->nextOps = nextOps;
-    pthread_cond_signal(&pool->cond);
+    pool->cond.notify_one();
   } else {
     pool->ops[pool->nextOpsEnd].next = nextOps;
   }
   pool->nextOpsEnd = nextOpsEnd;
-  pthread_mutex_unlock(&pool->mutex);
   return ncclSuccess;
 }
 
@@ -460,16 +494,19 @@ static ncclResult_t ncclLocalOpAppend(struct ncclComm* comm, struct ncclProxyCon
     op = pool->ops+opIndex;
     proxyOps->freeOp = op->next;
   } else {
-    int freeOp;
-    while ((freeOp = pool->freeOps[tpLocalRank]) == -1) sched_yield();
-    int freeOpNew;
-    while ((freeOpNew = __sync_val_compare_and_swap(pool->freeOps+tpLocalRank, freeOp, -1)) != freeOp) freeOp = freeOpNew;
+    // Read the freeOps value and wait for a value different than -1. Once not -1, read the value with acquire and reset -1
+    int freeOp = -1;
+    while (freeOp == -1) {
+      freeOp = COMPILER_ATOMIC_EXCHANGE(&pool->freeOps[tpLocalRank], -1, std::memory_order_acquire);
+      if (freeOp == -1) sched_yield();
+    }
     opIndex = freeOp;
     op = pool->ops+opIndex;
     proxyOps->freeOp = op->next;
   }
-  if (op->next != -1) __builtin_prefetch(pool->ops+op->next); // Prefetch next free op
+  if (op->next != -1) COMPILER_PREFETCH(pool->ops+op->next); // Prefetch next free op
   memcpy(op, proxyOp, sizeof(struct ncclProxyOp));
+  if (proxyOp->ringAlgo) proxyOp->ringAlgo->incRefCount();
   op->next = -1;
   op->connection = proxyConn->connection;
   if (proxyOps->nextOps == -1) {
@@ -508,6 +545,25 @@ static ncclResult_t ncclLocalOpAppend(struct ncclComm* comm, struct ncclProxyCon
   return ncclSuccess;
 }
 
+static void incWorkCounter(struct ncclComm* comm, struct ncclProxyOp* op) {
+  op->workCounter = (op->incWorkCounter) ? ++comm->profiler.workCounter[op->channelId] : comm->profiler.workCounter[op->channelId];
+}
+
+static ncclResult_t SaveProxyProfiler(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
+  struct ncclProxyConnector* proxyConn = (op->coll == ncclFuncRecv) ? &comm->profiler.recvProxyConn[op->channelId] : &comm->profiler.sendProxyConn[op->channelId];
+  if (justInquire) {
+    *justInquire = true;
+    if (!comm->planner.persistent) incWorkCounter(comm, op);
+  } else {
+    op->sendbuff = (uint8_t *)comm->profiler.workStarted;
+    op->recvbuff = (uint8_t *)comm->profiler.workCompleted;
+    // Ensure that in graph capturing the proxy workCounter is incremented to keep up with kernel workCounter
+    if (comm->planner.persistent) incWorkCounter(comm, op);
+    NCCLCHECK(ncclLocalOpAppend(comm, proxyConn, op));
+  }
+  return ncclSuccess;
+}
+
 static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel, int type, int peer, struct ncclProxyOp* op, int connIndex, bool* justInquire) {
   if (peer < 0) return ncclSuccess;
 
@@ -522,6 +578,7 @@ static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel
 
   if (justInquire) *justInquire = true;
   else {
+    op->peer = peer;
     NCCLCHECK(ncclLocalOpAppend(comm, &connector->proxyConn, op));
   }
   return ncclSuccess;
@@ -531,6 +588,7 @@ static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel
 // ncclProxySaveOp for this op.
 ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
   struct ncclChannel* channel = &comm->channels[op->channelId];
+  bool needProxy = false;
   if (justInquire) *justInquire = false;
   switch (op->pattern) {
   case ncclPatternRing:
@@ -538,12 +596,19 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternPipelineFrom:
   case ncclPatternPipelineTo: {
       struct ncclRing* ring = &channel->ring;
-      if (NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks)) {
-        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire));
+      needProxy = NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks);
+      if (op->coll == ncclFuncAllGatherV && op->pattern == ncclPatternRing) {
+        op->nsteps = op->specifics.bcast.recvSlices;
+        if (op->nsteps == 0) needProxy = false;
       }
-      if (NeedProxy(proxySend, op->pattern, op->root, ring, comm->nRanks)) {
-        NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire));
+      if (needProxy) NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire));
+
+      needProxy = NeedProxy(proxySend, op->pattern, op->root, ring, comm->nRanks);
+      if (op->coll == ncclFuncAllGatherV && op->pattern == ncclPatternRing) {
+        op->nsteps = op->specifics.bcast.sendSlices;
+        if (op->nsteps == 0) needProxy = false;
       }
+      if (needProxy) NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire));
     } break;
   case ncclPatternTreeUp:
   case ncclPatternTreeDown:
@@ -583,73 +648,84 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
       NCCLCHECK(SaveProxy(comm, channel, proxySend, channel->nvls.treeDown[2], op, 0, justInquire));
       NCCLCHECK(SaveProxy(comm, channel, proxyRecv, channel->nvls.treeUp, op, 0, justInquire));
     } break;
+  case ncclPatternPatUp: {
+      // Run full algorithm to count the number of steps for each peer.
+      ncclResult_t result = ncclSuccess;
+      const ssize_t size = op->nbytes/comm->nRanks;
+      const int rank = comm->rank, nranks = comm->nRanks;
+      int *nstepsSend = NULL, *nstepsRecv = NULL;
+      PatRSAlgorithm<char> algo(op->chunkSize, NCCL_STEPS, 16, 0, size, size, op->chunkSize, rank, nranks);
+      struct ncclPatStep ps = {0};
+      NCCLCHECKGOTO(ncclCalloc(&nstepsSend, log2Up(nranks)), result, exit_pat_up);
+      NCCLCHECKGOTO(ncclCalloc(&nstepsRecv, log2Up(nranks)), result, exit_pat_up);
+
+      do {
+        algo.getNextOp(&ps);
+        if (ps.flags & PatSkipped) continue;
+        if (ps.recvDim != -1 && ps.postRecv) nstepsRecv[ps.recvDim]++;
+        if (ps.sendDim != -1 && ps.postSend) nstepsSend[ps.sendDim]++;
+      } while (ps.last != 2);
+      for (int i=0; i<log2Up(nranks); i++) {
+        if (nstepsSend[i]) {
+          int sendPeer = (rank + (1<<i)) % nranks;
+          op->nsteps = nstepsSend[i];
+          NCCLCHECKGOTO(SaveProxy(comm, channel, proxySend, sendPeer, op, 0, justInquire), result, exit_pat_up);
+        }
+        if (nstepsRecv[i]) {
+          int recvPeer = (rank - (1<<i) + nranks) % nranks;
+          op->nsteps = nstepsRecv[i];
+          NCCLCHECKGOTO(SaveProxy(comm, channel, proxyRecv, recvPeer, op, 0, justInquire), result, exit_pat_up);
+        }
+      }
+    exit_pat_up:
+      free(nstepsSend);
+      free(nstepsRecv);
+      NCCLCHECK(result);
+    } break;
+  case ncclPatternPatDown: {
+      // Run full algorithm to count the number of steps for each peer.
+      ncclResult_t result = ncclSuccess;
+      const ssize_t size = op->nbytes/comm->nRanks;
+      const int rank = comm->rank, nranks = comm->nRanks;
+      int *nstepsSend = NULL, *nstepsRecv = NULL;
+      PatAGAlgorithm<char> algo(op->chunkSize, NCCL_STEPS, 16, 0, size, size, op->chunkSize, rank, nranks);
+      struct ncclPatStep ps = {0};
+      NCCLCHECKGOTO(ncclCalloc(&nstepsSend, log2Up(nranks)), result, exit_pat_down);
+      NCCLCHECKGOTO(ncclCalloc(&nstepsRecv, log2Up(nranks)), result, exit_pat_down);
+
+      do {
+        algo.getNextOp(&ps);
+        if (ps.flags & PatSkipped) continue;
+        if (ps.recvDim != -1 && ps.postRecv) nstepsRecv[ps.recvDim]++;
+        if (ps.sendDim != -1 && ps.postSend) nstepsSend[ps.sendDim]++;
+      } while (ps.last != 2);
+      for (int i=0; i<log2Up(nranks); i++) {
+        if (nstepsSend[i]) {
+          int sendPeer = (rank - (1<<i) + nranks) % nranks;
+          op->nsteps = nstepsSend[i];
+          NCCLCHECKGOTO(SaveProxy(comm, channel, proxySend, sendPeer, op, 0, justInquire), result, exit_pat_down);
+        }
+        if (nstepsRecv[i]) {
+          int recvPeer = (rank + (1<<i)) % nranks;
+          op->nsteps = nstepsRecv[i];
+          NCCLCHECKGOTO(SaveProxy(comm, channel, proxyRecv, recvPeer, op, 0, justInquire), result, exit_pat_down);
+        }
+      }
+    exit_pat_down:
+      free(nstepsSend);
+      free(nstepsRecv);
+      NCCLCHECK(result);
+    } break;
   case ncclPatternSend:
   case ncclPatternRecv: {
       if (op->root == comm->rank) return ncclSuccess;
       NCCLCHECK(SaveProxy(comm, channel, op->pattern == ncclPatternSend ? proxySend : proxyRecv, op->root, op, 1, justInquire));
     } break;
+  case ncclPatternProfiler: {
+      if (ncclProfilerNeedsProxy(comm, op)) NCCLCHECK(SaveProxyProfiler(comm, op, justInquire));
+      else incWorkCounter(comm, op);
+    } break;
   }
-  return ncclSuccess;
-}
-
-NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
-
-ncclResult_t ncclProxyComputeP2p(struct ncclInfo* info, struct ncclProxyOp* op, int reg) {
-  memset(op, 0, sizeof(struct ncclProxyOp));
-  int channelId = info->channelId;
-  struct ncclChannel* channel = info->comm->channels+channelId;
-  op->channelId = channelId;
-  op->sliceSteps = 1;
-  op->chunkSteps = 1;
-  op->dtype = info->datatype;
-  op->protocol = info->protocol;
-
-  int stepSize = info->comm->buffSizes[op->protocol]/NCCL_STEPS;
-
-  if (op->protocol == NCCL_PROTO_SIMPLE) stepSize = info->comm->p2pChunkSize;
-  info->chunkSize = stepSize;
-  op->root = info->root;
-
-  struct ncclChannelPeer* peer = channel->peers[op->root];
-  if (info->coll == ncclFuncSend) {
-    op->pattern = ncclPatternSend;
-    if (op->root != info->comm->rank && peer->send[1].transportComm == &netTransport.send) {
-      // Tune chunk size for the network
-      if (info->protocol == NCCL_PROTO_SIMPLE && info->count < stepSize) info->chunkSize /= 4;
-      else if (info->count < 8*stepSize) info->chunkSize /= 2;
-      if (info->protocol == NCCL_PROTO_SIMPLE && peer->send[1].proxyConn.sameProcess) op->reg = reg;
-    }
-  } else if (info->coll == ncclFuncRecv) {
-    op->pattern = ncclPatternRecv;
-    if (op->root != info->comm->rank && peer->recv[1].transportComm == &netTransport.recv) {
-      // Tune chunk size for the network
-      if (info->protocol == NCCL_PROTO_SIMPLE && info->count < stepSize) info->chunkSize /= 4;
-      else if (info->count < 8*stepSize) info->chunkSize /= 2;
-      if (info->protocol == NCCL_PROTO_SIMPLE && peer->recv[1].proxyConn.sameProcess) op->reg = reg;
-    }
-  } else {
-    WARN("P2p operation is neither send or recv");
-    return ncclInternalError;
-  }
-  if (ncclParamChunkSize() != 0) {
-    info->chunkSize = ncclParamChunkSize();
-  }
-  op->buffer = op->reg ? info->recvbuff : NULL;
-  op->chunkSize = info->chunkSize;
-  op->nbytes = info->count;
-
-  // Compute nSteps for proxies
-  int chunkEffectiveSize = op->chunkSize;
-  if (op->protocol == NCCL_PROTO_LL) {
-    chunkEffectiveSize /= 2;
-    op->nbytes *= 2;
-    op->nbytes = DIVUP(op->nbytes, sizeof(union ncclLLFifoLine)) * sizeof(union ncclLLFifoLine);
-  }
-
-  if (!op->reg) op->nbytes = std::min(op->nbytes, (ssize_t)info->chunkSize);
-  op->nsteps = DIVUP(info->count, chunkEffectiveSize);
-  if (op->nsteps == 0 || op->reg) op->nsteps = 1;
-
   return ncclSuccess;
 }
 
@@ -688,13 +764,16 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
 static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle) {
   struct ncclProxyArgs* prevOp = NULL;
   struct ncclProxyArgs* op = opStart;
+  ncclResult_t status = ncclSuccess;
   while (op) {
     if (op->state == ncclProxyOpNone) return ncclInternalError;
     TIME_START(0); TIME_START(1);
-    NCCLCHECK(op->progress(proxyState, op));
+    ncclResult_t ret = op->progress(proxyState, op);
     if (op->idle) { TIME_STOP(1); TIME_CANCEL(0); } else { TIME_CANCEL(1); TIME_STOP(0); }
     *idle &= op->idle;
-    if (op->state == ncclProxyOpNone) {
+    if (op->state == ncclProxyOpNone || ret != ncclSuccess) {
+      //track first error that occured
+      if (ret != ncclSuccess && status == ncclSuccess) status = ret;
       TIME_START(2);
       NCCLCHECK(removeOp(state, &op, &prevOp));
       TIME_STOP(2);
@@ -703,7 +782,7 @@ static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclPr
       op = op->next;
     }
   }
-  return ncclSuccess;
+  return status;
 }
 
 NCCL_PARAM(ProxyAppendBatchSize, "PROXY_APPEND_BATCH_SIZE", 16);
@@ -713,37 +792,35 @@ static ncclResult_t ncclProxyGetPostedOps(struct ncclProxyState* proxyState, int
   if (state->opsPool == NULL) return ncclInternalError;
   struct ncclProxyOpsPool* pool = state->opsPool;
 
-  struct ncclProxyArgs profArgs; // Only used for profiling purposes
   if (state->nextOps != -1) goto process_nextops;
 
+  void* eHandle;
   // If we have ops to progress, no need to block waiting for something to arrive or even wait for the lock
   // to be available. Exit, continue progress, and come back later.
-  if (state->active != NULL && (pool->nextOps == -1 || pthread_mutex_trylock(&pool->mutex) != 0)) return ncclSuccess;
+  {
+    std::unique_lock<std::mutex> lock(pool->mutex, std::defer_lock);
+    if (state->active != NULL && (pool->nextOps == -1 || !lock.try_lock())) return ncclSuccess;
 
-  if (state->active == NULL) {
-    pthread_mutex_lock(&pool->mutex);
-    while (pool->nextOps == -1 && !state->stop) {
-      struct ncclProxyArgs profArgs; // Only used for profiling purposes
-      ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileSleep);
-      pthread_cond_wait(&pool->cond, &pool->mutex);
-      ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileWakeup);
+    if (state->active == NULL) {
+      lock.lock();
+      if (pool->nextOps == -1 && !state->stop) {
+        ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
+        ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlSleep);
+        pool->cond.wait(lock);
+        ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlWakeup);
+        ncclProfilerStopProxyCtrlEvent(eHandle);
+      }
     }
-    if (state->stop) { // We might have been woken up to stop.
-      pthread_mutex_unlock(&pool->mutex);
-      return ncclSuccess;
-    }
+    state->nextOps = pool->nextOps;
+    pool->nextOps = pool->nextOpsEnd = -1;
   }
 
-  state->nextOps = pool->nextOps;
-  pool->nextOps = pool->nextOpsEnd = -1;
-  pthread_mutex_unlock(&pool->mutex);
-  if (state->nextOps == -1) return ncclInternalError;
-
 process_nextops:
-  ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileAppend);
+  ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
+  ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlAppend);
   TIME_START(2);
-  int freeOp[NCCL_MAX_LOCAL_RANKS];
-  int freeOpEnd[NCCL_MAX_LOCAL_RANKS];
+  int freeOp[NCCL_MAX_PROXY_CONNECTIONS];
+  int freeOpEnd[NCCL_MAX_PROXY_CONNECTIONS];
   for (int i = 0; i < proxyState->tpLocalnRanks; i++) freeOp[i] = -1;
 
   uint64_t lastOpCount = 0;
@@ -757,7 +834,7 @@ process_nextops:
     lastOpCount = peerOp->opCount;
     lastPeer = peer;
     if (peerOp->connection == NULL) return ncclInternalError;
-    if (peerOp->next != -1) __builtin_prefetch(pool->ops+peerOp->next);
+    if (peerOp->next != -1) COMPILER_PREFETCH(pool->ops+peerOp->next);
     NCCLCHECK(ProxyAppend(state, peerOp));
     (*added)++;
     int lastOpIndex = opIndex;
@@ -774,25 +851,20 @@ process_nextops:
 
   for (int i = 0; i < proxyState->tpLocalnRanks; i++) {
     if (freeOp[i] == -1) continue;
-    int newFree = freeOp[i];
-    int oldFree = pool->freeOps[i];
-    pool->ops[freeOpEnd[i]].next = oldFree;
-    if (oldFree == -1) {
-      // Nothing for the main thread to consume, we can set it.
-      pool->freeOps[i] = newFree;
-    } else {
-      // The main thread may recycle free ops at any time, replace the freeOps value atomically and check it worked.
-      int swap = __sync_val_compare_and_swap(pool->freeOps+i, oldFree, newFree);
-      if (swap != oldFree) {
-        if (swap != -1) return ncclInternalError;
-        // Ops were recycled while we were trying to swap, just set the value directly now.
-        pool->ops[freeOpEnd[i]].next = -1;
-        pool->freeOps[i] = newFree;
-      }
-    }
+    int oldFree = -1, swap = -1, newFree = freeOp[i];
+    // prepend the ops freeOp[i]-freeOpEnd[i] in front of the pool->freeOps[i] op
+    oldFree = COMPILER_ATOMIC_LOAD(&pool->freeOps[i], std::memory_order_acquire);
+    do {
+      // Coverity gets confused by the complex code structure here.  The previous "for" loop ensures that freeOpEnd[i]
+      // is initialized so long as freeOp[i] is initialized (is not -1).  In the current loop we filter out uninitialized
+      // freeOp[i], hence ensuring that freeOpEnd[i] is also initialized.
+      // coverity[uninit_use:FALSE]
+      pool->ops[freeOpEnd[i]].next = swap = oldFree;
+      COMPILER_ATOMIC_COMPARE_EXCHANGE(&pool->freeOps[i], &oldFree, newFree, /*success=*/std::memory_order_release, /*failure=*/std::memory_order_acquire);
+    } while (swap != oldFree);
   }
-  profArgs.opCount = *added;
-  ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileAppendEnd);
+  ncclProfilerRecordProxyCtrlEventState(eHandle, *added, ncclProfilerProxyCtrlAppendEnd);
+  ncclProfilerStopProxyCtrlEvent(eHandle);
   TIME_STOP(2);
   return ncclSuccess;
 }
@@ -814,24 +886,27 @@ static int setProxyThreadContext(struct ncclProxyState* proxyState) {
       if (CUPFN(cuCtxCreate) == nullptr || CUPFN(cuCtxDestroy) == nullptr || CUPFN(cuCtxSetCurrent) == nullptr) {
         WARN("Unable to create thread context due to old driver, disabling.");
         createThreadContext = 0;
+        goto exit;
       }
     }
   }
   if (createThreadContext) {
     if (proxyState->cudaCtx == NULL) {
       if (CUPFN(cuCtxCreate(&proxyState->cudaCtx,
-                                  CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, proxyState->cudaDev)) != CUDA_SUCCESS) {
+                            NULL, 0, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, proxyState->cudaDev)) != CUDA_SUCCESS) {
         WARN("Failed to create CUDA context on device %d", proxyState->cudaDev);
         createThreadContext = 0;
+        goto exit;
       }
     } else {
       if (CUPFN(cuCtxSetCurrent(proxyState->cudaCtx)) != CUDA_SUCCESS) {
         WARN("Failed to set CUDA context on device %d", proxyState->cudaDev);
-        return 0;
+        goto exit;
       }
-      return 1;
     }
+    return 1;
   }
+exit:
 #endif
   return 0;
 }
@@ -840,14 +915,43 @@ static int setProxyThreadContext(struct ncclProxyState* proxyState) {
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
 
+static ncclAffinity proxyCpuset;
+static std::once_flag proxyCpusetOnceFlag;
+void proxyCpusetOnceFunc() {
+  const char* setEnv = ncclGetEnv("NCCL_PROXY_CPUSET");
+  if (setEnv) {
+    ncclResult_t res = ncclStrListToCpuset(setEnv, &proxyCpuset);
+    if (res != ncclSuccess) {
+      INFO(NCCL_ENV, "failed to decode NCCL_PROXY_CPUSET=%s. Ignoring", setEnv);
+      goto fail;
+    }
+    // debug info
+    char msg[1024] = {0};
+    ncclAffinity currSet;
+    ncclOsGetAffinity(&currSet);
+    (void)ncclCpusetToStrList(&currSet, msg, sizeof(msg));
+    snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg), " changed to ");
+    (void)ncclCpusetToStrList(&proxyCpuset, msg + strlen(msg), sizeof(msg) - strlen(msg));
+    INFO(NCCL_ENV, "NCCL_PROXY_CPUSET = %s: %s", setEnv, msg);
+    return;
+  }
+  // if we arrive here we have either no env or we have failed to decode it
+fail:
+  ncclOsCpuZero(proxyCpuset);
+  return;
+}
+
 void* ncclProxyProgress(void *proxyState_) {
   struct ncclProxyState* proxyState = (struct ncclProxyState*)proxyState_;
+
+  // This thread is created by proxyService, therefore setting the affinity is not needed.
+  INFO(NCCL_INIT, "[Proxy Progress] Device %d CPU core %d", proxyState->cudaDev, ncclOsGetCpu());
+
   if (setProxyThreadContext(proxyState)) {
-    INFO(NCCL_INIT, "[Proxy Progress] Created CUDA context on device %d", proxyState->cudaDev);
-  } else if (cudaSetDevice(proxyState->cudaDev) != cudaSuccess) {
+    INFO(NCCL_INIT, "[Proxy Progress] Set CUDA context on device %d", proxyState->cudaDev);
+  } else if (!CUDASUCCESS(cudaSetDevice(proxyState->cudaDev))) {
     WARN("[Proxy Progress] Failed to set CUDA device %d", proxyState->cudaDev);
   }
-  // if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
 
   struct ncclProxyProgressState* state = &proxyState->progressState;
   state->nextOps = -1;
@@ -865,34 +969,37 @@ void* ncclProxyProgress(void *proxyState_) {
    * ncclParamProgressAppendOpFreq(). If they are equal, we will append proxy ops. This will decrease the
    * frequency of calling ncclProxyGetPostedOps() and reduce the perf impact. */
   int proxyOpAppendCounter = 0;
-  struct ncclProxyArgs profArgs; // Only used for profiling purposes
-  while ((state->stop == 0 || (state->stop == 1 && state->active)) && *proxyState->abortFlag == 0) {
+  do {
     int idle = 1;
     ncclResult_t ret = progressOps(proxyState, state, state->active, &idle);
     if (ret != ncclSuccess) {
-      __atomic_store_n(&proxyState->asyncResult, ret, __ATOMIC_RELEASE);
+      COMPILER_ATOMIC_STORE(&proxyState->asyncResult, ret, std::memory_order_release);
       INFO(NCCL_ALL,"%s:%d -> %d [Progress Thread]", __FILE__, __LINE__, ret);
-      continue;
+      break;
     }
-    if (lastIdle == 0 && idle == 1) ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileIdle);
-    if (lastIdle == 1 && idle == 0) ncclProfilingRecord(&profArgs, 0, 0, ncclProxyProfileActive);
-    if (idle || (++proxyOpAppendCounter == ncclParamProgressAppendOpFreq())) {
+    if ((lastIdle == 0 && idle == 1) || (lastIdle == 1 && idle == 0)) {
+      void* eHandle;
+      ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
+      if (lastIdle == 0 && idle == 1) ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlIdle);
+      if (lastIdle == 1 && idle == 0) ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlActive);
+      ncclProfilerStopProxyCtrlEvent(eHandle);
+    }
+    if (idle || !state->active || (++proxyOpAppendCounter == ncclParamProgressAppendOpFreq())) {
       int added = 0;
       proxyOpAppendCounter = 0;
       TIME_START(3);
-      if (state->stop == 0)
-        ret = ncclProxyGetPostedOps(proxyState, &added);
+      ret = ncclProxyGetPostedOps(proxyState, &added);
       if (added) { TIME_STOP(3); } else { TIME_CANCEL(3); }
       if (ret != ncclSuccess) {
-        __atomic_store_n(&proxyState->asyncResult, ret, __ATOMIC_RELEASE);
+        COMPILER_ATOMIC_STORE(&proxyState->asyncResult, ret, std::memory_order_release);
         INFO(NCCL_ALL,"%s:%d -> %d [Progress Thread]", __FILE__, __LINE__, ret);
       }
       if (added == 0) {
-        sched_yield(); // No request progressed. Let others run.
+        std::this_thread::yield(); // No request progressed. Let others run.
       }
     }
     lastIdle = idle;
-  }
+  } while ((state->stop == 0 || (state->stop == 1 && state->active)) && COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire) == 0);
   return NULL;
 }
 
@@ -914,8 +1021,8 @@ ncclResult_t ncclProxyStart(struct ncclComm* comm) {
 
 static ncclResult_t ncclProxyProgressCreate(struct ncclProxyState* proxyState) {
   struct ncclProxyProgressState* state = &proxyState->progressState;
-  if (!state->thread) {
-    pthread_create(&state->thread, NULL, ncclProxyProgress, proxyState);
+  if (!state->thread.joinable()) {
+    state->thread = std::thread(ncclProxyProgress, proxyState);
     ncclSetThreadName(state->thread, "NCCL Progress%2d", proxyState->tpLocalnRanks);
   }
   return ncclSuccess;
@@ -926,11 +1033,12 @@ ncclResult_t ncclProxyProgressDestroy(struct ncclProxyState* proxyState) {
 
   // Request the proxy to stop and then wake it
   if (state->opsPool) {
-    pthread_mutex_lock(&state->opsPool->mutex);
-    state->stop = 1;
-    pthread_cond_signal(&state->opsPool->cond);
-    pthread_mutex_unlock(&state->opsPool->mutex);
-    pthread_join(state->thread, NULL);
+    {
+      std::lock_guard<std::mutex> lock(state->opsPool->mutex);
+      state->stop = 1;
+      state->opsPool->cond.notify_one();
+    }
+    state->thread.join();
   }
 
   // Free off any memory allocated for the proxy arg pools
@@ -940,7 +1048,6 @@ ncclResult_t ncclProxyProgressDestroy(struct ncclProxyState* proxyState) {
     state->pools = next;
   }
 
-  ncclProfilingDump();
   TIME_PRINT("Proxy");
   return ncclSuccess;
 }
@@ -1017,23 +1124,18 @@ struct ncclProxyInitResp {
   char devShmPath[6]; // "XXXXXX" - May or may not be set
 };
 
-ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int tpProxyRank, struct ncclProxyConnector* proxyConn) {
+ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int proxyRank, struct ncclProxyConnector* proxyConn) {
   struct ncclSocket* sock;
-  int ready, proxyRank = -1;
+  int ready;
   struct ncclProxyState* sharedProxyState = comm->proxyState;
+  int tpProxyRank = comm->topParentRanks[proxyRank];
 
-  // Keep one connection per local rank
-  for (int i = 0; i < comm->localRanks; ++i) {
-    /* find the proxy rank in comm. */
-    if (comm->topParentRanks[comm->localRankToRank[i]] == tpProxyRank) {
-      proxyRank = comm->localRankToRank[i];
-      break;
-    }
-  }
-  proxyConn->sameProcess = comm->peerInfo[proxyRank].pidHash == comm->peerInfo[comm->rank].pidHash ? 1 : 0;
+  proxyConn->sameProcess = ((comm->peerInfo[proxyRank].hostHash == comm->peerInfo[comm->rank].hostHash) &&
+                            (comm->peerInfo[proxyRank].pidHash == comm->peerInfo[comm->rank].pidHash)) ? 1 : 0;
   // Keep one connection per local rank
   proxyConn->connection = NULL;
   proxyConn->tpRank = tpProxyRank;
+  proxyConn->rank = proxyRank;
   if (sharedProxyState->peerSocks == NULL) {
     NCCLCHECK(ncclCalloc(&sharedProxyState->peerSocks, comm->sharedRes->tpNLocalRanks));
     NCCLCHECK(ncclCalloc(&sharedProxyState->proxyOps, comm->sharedRes->tpNLocalRanks));
@@ -1071,72 +1173,112 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
     strncpy(poolPath+sizeof("/dev/shm/nccl-")-1, resp.devShmPath, sizeof("XXXXXX")-1);
     struct ncclProxyOps* proxyOps = sharedProxyState->proxyOps + proxyConn->tpLocalRank;
     if (proxyOps->pool == NULL) {
-      NCCLCHECK(ncclShmOpen(poolPath, sizeof(struct ncclProxyOpsPool), (void**)(&proxyOps->pool), NULL, 0, &proxyOps->handle));
+      NCCLCHECK(ncclShmOpen(poolPath, sizeof(poolPath), sizeof(struct ncclProxyOpsPool), (void**)(&proxyOps->pool), NULL, -1, &proxyOps->handle));
       proxyOps->nextOps = proxyOps->nextOpsEnd = proxyOps->freeOp = -1;
     }
   }
+  proxyConn->initialized = true;
   INFO(NCCL_NET|NCCL_PROXY, "Connected to proxy localRank %d -> connection %p", proxyConn->tpLocalRank, proxyConn->connection);
   return ncclSuccess;
 }
 
 // UDS support
-ncclResult_t ncclProxyCallBlockingUDS(struct ncclComm* comm, int tpRank, int type, void* reqBuff, int reqSize, void* respBuff, int respSize, int *respFd) {
+ncclResult_t ncclProxyCallBlockingUDS(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int type, void* reqBuff, int reqSize, void* respBuff, int respSize, int* reqFd, int *respFd) {
   ncclResult_t res = ncclSuccess;
   struct ncclIpcSocket ipcSock = { 0 };
-  void *opId = (void*)((((uintptr_t)random()) << 32) | random());
+  void *opId;
+  NCCLCHECK(getRandomData(&opId, sizeof(opId)));
+  int reqFdtmp = -1;
 
   int rank = comm->topParentLocalRanks[comm->localRank];
   struct ncclProxyState* sharedProxyState = comm->proxyState;
-  uint64_t pidHash = sharedProxyState->peerAddressesUDS[tpRank];
+  uint64_t pidHash = sharedProxyState->peerAddressesUDS[proxyConn->tpRank];
 
   INFO(NCCL_PROXY, "ProxyCall UDS comm %p rank %d tpRank %d(%lx) reqSize %d respSize %d respFd %p opId %p",
-       comm, rank, tpRank, pidHash, reqSize, respSize, respFd, opId);
+       comm, rank, proxyConn->tpRank, pidHash, reqSize, respSize, respFd, opId);
 
   // cuMem: Create a UDS socket to receive the response
   NCCLCHECK(ncclIpcSocketInit(&ipcSock, rank, (uint64_t)opId, comm->abortFlag));
 
+  if (reqFd) {
+    reqFdtmp = *reqFd;
+  } else {
+    // give a dummy fd for the other side of UDS socket
+    NCCLCHECK(ncclIpcSocketGetFd(&ipcSock, &reqFdtmp));
+  }
+
   ncclIpcHdr hdr;
+  memset(&hdr, '\0', sizeof(hdr));
   hdr.type = type;
   hdr.rank = rank;
   hdr.reqSize = reqSize;
   hdr.respSize = respSize;
   hdr.opId = opId;
+
   assert(reqSize <= sizeof(hdr.data));
   memcpy(&hdr.data, reqBuff, reqSize);
-  NCCLCHECKGOTO(ncclIpcSocketSendMsg(&ipcSock, &hdr, sizeof(hdr), -1, tpRank, pidHash), res, error);
+  NCCLCHECKGOTO(ncclIpcSocketSendMsg(&ipcSock, &hdr, sizeof(hdr), reqFdtmp, proxyConn->tpRank, pidHash), res, error);
   NCCLCHECKGOTO(ncclIpcSocketRecvMsg(&ipcSock, respBuff, respSize, respFd), res, error);
   NCCLCHECKGOTO(ncclIpcSocketClose(&ipcSock), res, error);
 
   INFO(NCCL_PROXY, "ProxyCall UDS comm %p rank %d tpRank %d(%lx) reqSize %d respSize %d respFd %d opId %p - DONE",
-       comm, rank, tpRank, pidHash, reqSize, respSize, (respFd ? *respFd : -1), opId);
+       comm, rank, proxyConn->tpRank, pidHash, reqSize, respSize, (respFd ? *respFd : -1), opId);
 
   return res;
 
 error:
   NCCLCHECK(ncclIpcSocketClose(&ipcSock));
-  WARN("ncclProxyCallBlockingUDS call to tpRank %d(%lx) failed : %d", tpRank, pidHash, res);
+  WARN("ncclProxyCallBlockingUDS call to tpRank %d(%lx) failed : %d", proxyConn->tpRank, pidHash, res);
   return res;
 }
 
 // cuMem API support
 // The request/response is sent out-of-band using ncclIpcSocket for this specific command
-ncclResult_t ncclProxyClientGetFdBlocking(struct ncclComm* comm, int tpRank, void *handle, int* convertedFd) {
+ncclResult_t ncclProxyClientGetFdBlocking(struct ncclComm* comm, int proxyRank, void *handle, int* convertedFd) {
   ncclResult_t ret = ncclSuccess;
 
   // Request the allocation of a UDS fd for the handle
-  NCCLCHECKGOTO(ncclProxyCallBlockingUDS(comm, tpRank, ncclProxyMsgGetFd, handle, sizeof(CUmemGenericAllocationHandle), NULL, 0, convertedFd), ret, error);
+  if (comm->gproxyConn[proxyRank].initialized == false) {
+    NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_P2P, 1, proxyRank, &comm->gproxyConn[proxyRank]), ret, error);
+  }
+  NCCLCHECKGOTO(ncclProxyCallBlockingUDS(comm, &comm->gproxyConn[proxyRank], ncclProxyMsgGetFd, handle, sizeof(CUmemGenericAllocationHandle), NULL, 0, NULL, convertedFd), ret, error);
 
   // We have now received the converted fd over UDS
-  INFO(NCCL_PROXY, "UDS: ClientGetFd handle 0x%lx tpRank %d returned fd %d", *(uint64_t*)handle, tpRank, *convertedFd);
+  INFO(NCCL_PROXY, "UDS: ClientGetFd handle 0x%lx tpRank %d returned fd %d sameProcess %d", *(uint64_t*)handle, comm->topParentRanks[proxyRank], *convertedFd, comm->gproxyConn[proxyRank].sameProcess);
 
   return ret;
 
 error:
-  WARN("ncclProxyClientGetFd call to tpRank %d handle 0x%lx failed : %d", tpRank, *(uint64_t*)handle, ret);
+  WARN("ncclProxyClientGetFd call to tpRank %d handle 0x%lx failed : %d", comm->topParentRanks[proxyRank], *(uint64_t*)handle, ret);
   return ret;
 }
 
-const char* ncclProxyMsgTypeStr[] = { "Unknown", "Init", "SharedInit", "Setup", "Connect", "Start", "Close", "Abort", "Stop", "GetFd" };
+ncclResult_t ncclProxyClientBatchQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int* localFds, int* rmtFds, int numSegments) {
+  ncclResult_t ret = ncclSuccess;
+  for (int segment = 0; segment < numSegments; segment++) {
+    NCCLCHECKGOTO(ncclProxyCallBlockingUDS(comm, proxyConn, ncclProxyMsgQueryFd, NULL, 0, (void*) &rmtFds[segment], sizeof(int), &localFds[segment], NULL), ret, fail);
+    // We have now received the converted fd for a segment over UDS
+    INFO(NCCL_PROXY, "UDS: ClientQueryFdBatch localFd %d tpRank %d remote fd %d sameProcess %d segment %d", localFds[segment], proxyConn->tpRank, rmtFds[segment], proxyConn->sameProcess, segment);
+  }
+exit:
+  return ret;
+fail:
+  goto exit;
+}
+
+ncclResult_t ncclProxyClientQueryFdBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int localFd, int* rmtFd) {
+  ncclResult_t ret = ncclSuccess;
+  NCCLCHECKGOTO(ncclProxyCallBlockingUDS(comm, proxyConn, ncclProxyMsgQueryFd, NULL, 0, (void*)rmtFd, sizeof(int), &localFd, NULL), ret, fail);
+exit:
+  // We have now received the converted fd over UDS
+  INFO(NCCL_PROXY, "UDS: ClientQueryFd localFd %d tpRank %d remote fd %d sameProcess %d", localFd, proxyConn->tpRank, *rmtFd, proxyConn->sameProcess);
+  return ret;
+fail:
+  WARN("ncclProxyClientQueryFdBlocking call to tpRank %d localFd %d failed : %d", proxyConn->tpRank, localFd, ret);
+  goto exit;
+}
+
+const char* ncclProxyMsgTypeStr[] = { "Unknown", "Init", "SharedInit", "Setup", "Connect", "Start", "Close", "Abort", "Stop", "GetFd", "QueryFd", "Register", "Deregister" };
 ncclResult_t ncclProxyCallAsync(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int type, void* reqBuff, int reqSize, int respSize, void* opId) {
   struct ncclSocket* sock;
   ncclResult_t ret = ncclSuccess;
@@ -1145,7 +1287,6 @@ ncclResult_t ncclProxyCallAsync(struct ncclComm* comm, struct ncclProxyConnector
   if (sharedProxyState->peerSocks == NULL) return ncclInternalError;
 
   sock = sharedProxyState->peerSocks + proxyConn->tpLocalRank;
-  if (sock == NULL) return ncclInternalError;
 
   NCCLCHECKGOTO(ncclSocketSend(sock, &type, sizeof(int)), ret, error);
   NCCLCHECKGOTO(ncclSocketSend(sock, &proxyConn->connection, sizeof(void*)), ret, error);
@@ -1167,7 +1308,7 @@ error:
 ncclResult_t ncclPollProxyResponse(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, void* respBuff, void* opId) {
   struct ncclProxyState* sharedProxyState = comm->proxyState;
   // Receive the connection pointer from the Proxy
-  if (__atomic_load_n(comm->abortFlag, __ATOMIC_RELAXED)) {
+  if (COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire)) {
     WARN("Comm %p is in abort state", comm);
     return ncclInternalError;
   }
@@ -1249,7 +1390,7 @@ static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
 
     char shmPath[sizeof("/dev/shm/nccl-XXXXXX")];
     shmPath[0] = '\0';
-    NCCLCHECK(ncclShmOpen(shmPath, size, (void**)&pool, NULL, proxyState->tpLocalnRanks + 1, &state->handle));
+    NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), size, (void**)&pool, NULL, proxyState->tpLocalnRanks, &state->handle));
     // Init pool
     pool->nextOps = -1;
 
@@ -1259,14 +1400,8 @@ static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
       pool->ops[(r+1)*MAX_OPS_PER_PEER-1].next = -1;
     }
 
-    // Setup mutex/cond to work inter-process
-    pthread_mutexattr_t mutexAttr;
-    pthread_mutexattr_init(&mutexAttr);
-    pthread_mutexattr_setpshared(&mutexAttr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&pool->mutex, &mutexAttr);
-    pthread_condattr_t condAttr;
-    pthread_condattr_setpshared(&condAttr, PTHREAD_PROCESS_SHARED);
-    pthread_cond_init(&pool->cond, &condAttr);
+    ncclOsSetMutexCondShared(pool->mutex, pool->cond);
+
     state->opsPool = pool;
 
     memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);
@@ -1317,8 +1452,24 @@ static ncclResult_t proxyConnInit(struct ncclProxyLocalPeer* peer, struct ncclPr
     strncpy(resp->devShmPath, state->opsPoolShmSuffix, sizeof(resp->devShmPath));
   }
   INFO(NCCL_NET|NCCL_PROXY, "New proxy %s connection %d from local rank %d, transport %d", (*connection)->send ? "send":"recv", id, (*connection)->tpLocalRank, (*connection)->transport);
-  __atomic_store_n(&(*connection)->state, connInitialized, __ATOMIC_RELEASE);
+  COMPILER_ATOMIC_STORE(&(*connection)->state, connInitialized, std::memory_order_release);
   return ncclSuccess;
+}
+
+static ncclResult_t proxyQueryFd(struct ncclProxyState* proxyState, int rank, void *opId, int rmtFd) {
+#if CUDART_VERSION >= 11030
+  struct ncclIpcSocket ipcSock = { 0 };
+  uint64_t hash = (uint64_t) opId;
+  ncclResult_t ret = ncclSuccess;
+
+  NCCLCHECKGOTO(ncclIpcSocketInit(&ipcSock, proxyState->tpRank, hash^1, proxyState->abortFlag), ret, exit);
+  NCCLCHECKGOTO(ncclIpcSocketSendMsg(&ipcSock, &rmtFd, sizeof(int), -1, rank, hash), ret, exit);
+exit:
+  NCCLCHECK(ncclIpcSocketClose(&ipcSock));
+  return ncclSuccess;
+#else
+  return ncclInternalError;
+#endif
 }
 
 // cuMem API support
@@ -1340,7 +1491,7 @@ static ncclResult_t proxyGetFd(struct ncclProxyState* proxyState, int rank, void
 error:
   NCCLCHECK(ncclIpcSocketClose(&ipcSock));
   // We can now safely close the exported fd
-  (void) close(fd);
+  SYSCHECK(close(fd), "close");
   return ret;
 #else
   return ncclInternalError;
@@ -1360,19 +1511,25 @@ static ncclResult_t proxyProgressAsync(struct ncclProxyAsyncOp* op, struct ncclP
     int nChannels = (int) *op->reqBuff;
     TRACE(NCCL_PROXY, "proxyProgressAsync::ncclProxyMsgSharedInit opId=%p op.reqBuff=%p nChannels=%d", op->opId, op->reqBuff, nChannels);
     if (op->connection->tcomm->proxySharedInit) res = op->connection->tcomm->proxySharedInit(op->connection, proxyState, nChannels);
-    __atomic_store_n(&op->connection->state, connSharedInitialized, __ATOMIC_RELEASE);
+    COMPILER_ATOMIC_STORE(&op->connection->state, connSharedInitialized, std::memory_order_release);
   }
   else if (op->type == ncclProxyMsgInit) {
     TRACE(NCCL_PROXY, "proxyProgressAsync::ncclProxyMsgInit opId=%p op.reqBuff=%p", op->opId, op->reqBuff);
     res = proxyConnInit(peer, connectionPool, proxyState, (ncclProxyInitReq*) op->reqBuff, (ncclProxyInitResp*) op->respBuff, &op->connection);
+  } else if (op->type == ncclProxyMsgRegister) {
+    TRACE(NCCL_PROXY, "proxyProgressAsync::ncclProxyMsgRegister opId=%p op.reqBuff=%p, op->reqSize=%d, op->respSize=%d", op->opId, op->reqBuff, op->reqSize, op->respSize);
+    res = op->connection->tcomm->proxyRegister(op->connection, proxyState, op->reqBuff, op->reqSize, op->respBuff, op->respSize, &done);
+  } else if (op->type == ncclProxyMsgDeregister) {
+    TRACE(NCCL_PROXY, "proxyProgressAsync::ncclProxyMsgDeregister opId=%p op.reqBuff=%p, op->reqSize=%d, op->respSize=%d", op->opId, op->reqBuff, op->reqSize, op->respSize);
+    res = op->connection->tcomm->proxyDeregister(op->connection, proxyState, op->reqBuff, op->reqSize, &done);
   } else return ncclInternalError;
 
   if (done) {
     INFO(NCCL_PROXY, "proxyProgressAsync opId=%p op.type=%d op.reqBuff=%p op.respSize=%d done", op->opId, op->type, op->reqBuff, op->respSize);
     if (op->type == ncclProxyMsgSetup)
-      __atomic_store_n(&op->connection->state, connSetupDone, __ATOMIC_RELEASE);
+      COMPILER_ATOMIC_STORE(&op->connection->state, connSetupDone, std::memory_order_release);
     else if (op->type == ncclProxyMsgConnect)
-      __atomic_store_n(&op->connection->state, connConnected, __ATOMIC_RELEASE);
+      COMPILER_ATOMIC_STORE(&op->connection->state, connConnected, std::memory_order_release);
     /* if setup or connect is done, we should not return any error at this point since
      * ncclSocketSend might already send the respBuff to the requester. If we still choose
      * to abort and close the connection, it can cause segfault if the requester is using
@@ -1392,7 +1549,7 @@ static ncclResult_t proxyProgressAsync(struct ncclProxyAsyncOp* op, struct ncclP
     (*asyncOpCount)--;
     return ncclSuccess;
 
-  } else if (__atomic_load_n(proxyState->abortFlag, __ATOMIC_RELAXED) != 0) {
+  } else if (COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire) != 0) {
     return ncclInternalError;
   }
 
@@ -1400,30 +1557,37 @@ static ncclResult_t proxyProgressAsync(struct ncclProxyAsyncOp* op, struct ncclP
 }
 
 static ncclResult_t proxyServiceInitOp(int type, struct ncclProxyLocalPeer* peer, struct ncclProxyConnectionPool* connectionPool, struct ncclProxyState* proxyState, int* asyncOpCount) {
+  ncclResult_t ret = ncclSuccess;
   struct ncclSocket* sock = &peer->sock;
   struct ncclProxyAsyncOp* asyncOp;
   NCCLCHECK(ncclCalloc(&asyncOp, 1));
 
   asyncOp->type = type;
-  NCCLCHECK(ncclSocketRecv(sock, &asyncOp->connection, sizeof(void*)));
+  NCCLCHECKGOTO(ncclSocketRecv(sock, &asyncOp->connection, sizeof(void*)), ret, fail);
 
-  NCCLCHECK(ncclSocketRecv(sock, &asyncOp->reqSize, sizeof(int)));
-  NCCLCHECK(ncclSocketRecv(sock, &asyncOp->respSize, sizeof(int)));
+  NCCLCHECKGOTO(ncclSocketRecv(sock, &asyncOp->reqSize, sizeof(int)), ret, fail);
+  NCCLCHECKGOTO(ncclSocketRecv(sock, &asyncOp->respSize, sizeof(int)), ret, fail);
   if (asyncOp->reqSize) {
-    NCCLCHECK(ncclCalloc(&asyncOp->reqBuff, asyncOp->reqSize));
-    NCCLCHECK(ncclSocketRecv(sock, asyncOp->reqBuff, asyncOp->reqSize));
+    NCCLCHECKGOTO(ncclCalloc(&asyncOp->reqBuff, asyncOp->reqSize), ret, fail);
+    NCCLCHECKGOTO(ncclSocketRecv(sock, asyncOp->reqBuff, asyncOp->reqSize), ret, fail);
   }
 
   // Store opId for completion response
-  NCCLCHECK(ncclSocketRecv(sock, &asyncOp->opId, sizeof(asyncOp->opId)));
+  NCCLCHECKGOTO(ncclSocketRecv(sock, &asyncOp->opId, sizeof(asyncOp->opId)), ret, fail);
 
-  if (asyncOp->respSize) NCCLCHECK(ncclCalloc(&asyncOp->respBuff, asyncOp->respSize));
+  if (asyncOp->respSize) NCCLCHECKGOTO(ncclCalloc(&asyncOp->respBuff, asyncOp->respSize), ret, fail);
 
   asyncProxyOpEnqueue(peer, asyncOp);
 
   (*asyncOpCount)++;
   NCCLCHECK(proxyProgressAsync(asyncOp, proxyState, asyncOpCount, peer, connectionPool));
-  return ncclSuccess;
+exit:
+  return ret;
+fail:
+  if (asyncOp->reqBuff) free(asyncOp->reqBuff);
+  if (asyncOp->respBuff) free(asyncOp->respBuff);
+  free(asyncOp);
+  goto exit;
 }
 
 #include <poll.h>
@@ -1435,21 +1599,33 @@ static bool proxyMatchOpType(int type) {
     case ncclProxyMsgSetup:
     case ncclProxyMsgConnect:
     case ncclProxyMsgGetFd:
+    case ncclProxyMsgRegister:
+    case ncclProxyMsgDeregister:
       return true;
     default:
       return false;
   }
 }
 
+enum {
+  PROXY_RUNNING = 0,
+  PROXY_STOP = 1,
+  PROXY_ABORT = 2
+};
+
 void* ncclProxyService(void* _args) {
   struct ncclProxyState* proxyState =  (struct ncclProxyState*) _args;
-  // if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
+
+  // set the thread affinity before setting the cuda context
+  std::call_once(proxyCpusetOnceFlag, proxyCpusetOnceFunc);
+  if (ncclOsCpuCount(proxyCpuset)) ncclOsSetAffinity(proxyCpuset);
+  INFO(NCCL_INIT, "[Proxy Service] Device %d CPU core %d", proxyState->cudaDev, ncclOsGetCpu());
+
   if (setProxyThreadContext(proxyState)) {
     INFO(NCCL_INIT, "[Proxy Service] Created CUDA context on device %d", proxyState->cudaDev);
-  } else if (cudaSetDevice(proxyState->cudaDev) != cudaSuccess) {
+  } else if (!CUDASUCCESS(cudaSetDevice(proxyState->cudaDev))) {
     WARN("[Proxy Service] Failed to set CUDA device %d", proxyState->cudaDev);
   }
-  // if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
 
   // Prepare poll descriptor
   struct ncclProxyConnectionPool connectionPool;
@@ -1457,42 +1633,44 @@ void* ncclProxyService(void* _args) {
   connectionPool.banks = 0;
   connectionPool.offset = NCCL_PROXY_CONN_POOL_SIZE;
 
-  struct pollfd pollfds[NCCL_MAX_LOCAL_RANKS+1];
-  struct ncclProxyLocalPeer peers[NCCL_MAX_LOCAL_RANKS];
-  memset(&peers, 0, sizeof(struct ncclProxyLocalPeer)*NCCL_MAX_LOCAL_RANKS);
-  for (int s=0; s<NCCL_MAX_LOCAL_RANKS; s++) {
-    pollfds[s].fd = -1;
+  struct pollfd pollfds[NCCL_MAX_PROXY_CONNECTIONS+1]; // one extra for listenSock fd
+  struct ncclProxyLocalPeer peers[NCCL_MAX_PROXY_CONNECTIONS];
+  memset(&peers, 0, sizeof(struct ncclProxyLocalPeer)*NCCL_MAX_PROXY_CONNECTIONS);
+  for (int s=0; s<NCCL_MAX_PROXY_CONNECTIONS; s++) {
+    pollfds[s].fd = NCCL_INVALID_SOCKET;
     pollfds[s].events = POLLHUP|POLLIN;
   }
-  if (ncclSocketGetFd(proxyState->listenSock, &pollfds[NCCL_MAX_LOCAL_RANKS].fd) != ncclSuccess) {
+  if (ncclSocketGetFd(proxyState->listenSock, &pollfds[NCCL_MAX_PROXY_CONNECTIONS].fd) != ncclSuccess) {
     WARN("[Proxy Service] Get listenSock fd fails");
     return NULL;
   };
-  pollfds[NCCL_MAX_LOCAL_RANKS].events = POLLIN;
+  pollfds[NCCL_MAX_PROXY_CONNECTIONS].events = POLLIN;
 
   int maxnpeers = 0;
   int npeers = 0;
-  int stop = 0;
+  int stop = PROXY_RUNNING;
   int asyncOpCount = 0;
-  while (stop == 0 || (stop == 1 && npeers > 0)) {
+  while (stop == PROXY_RUNNING || npeers > 0) {
     /* Even if local comm aborts, we cannot let proxy thread exit if we still have peer
      * connections. Need to wait until all other related comms call abort and safely exit
      * together, or we could face segmentation fault. */
-    if (__atomic_load_n(proxyState->abortFlag, __ATOMIC_RELAXED) != 0) stop = 1;
+    if (COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire) != 0) stop = PROXY_ABORT;
     /* never let proxy service thread blocks in poll, or it cannot receive abortFlag. */
     int ret;
     do {
-      ret = poll(pollfds, NCCL_MAX_LOCAL_RANKS+1, asyncOpCount ? 0 : 500);
+      // poll all fds including the listenSock
+      ret = poll(pollfds, NCCL_MAX_PROXY_CONNECTIONS+1, asyncOpCount ? 0 : 500);
     } while (ret < 0 && errno == EINTR);
     if (ret < 0) {
       WARN("[Proxy Service] Poll failed: %s", strerror(errno));
       return NULL;
     }
-    if (pollfds[NCCL_MAX_LOCAL_RANKS].revents) {
+    if (pollfds[NCCL_MAX_PROXY_CONNECTIONS].revents) {
+      // We got an event on the listenSock
       int s = 0;
-      while (s < NCCL_MAX_LOCAL_RANKS && pollfds[s].fd >= 0) s++;
-      if (s == NCCL_MAX_LOCAL_RANKS) {
-        WARN("[Proxy service] Too many connections (%d max)", NCCL_MAX_LOCAL_RANKS);
+      while (s < NCCL_MAX_PROXY_CONNECTIONS && pollfds[s].fd >= 0) s++;
+      if (s == NCCL_MAX_PROXY_CONNECTIONS) {
+        WARN("[Proxy service] Too many connections (%d max)", NCCL_MAX_PROXY_CONNECTIONS);
         return NULL;
       }
       if (maxnpeers < s+1) maxnpeers = s+1;
@@ -1517,13 +1695,17 @@ void* ncclProxyService(void* _args) {
       int closeConn = 0;
       int type = 0;
       ncclResult_t res = ncclSuccess;
-      if (pollfds[s].fd == -1) continue;
+      if (pollfds[s].fd == NCCL_INVALID_SOCKET) continue;
 
       // Progress all ops for this ncclProxyLocalPeer
+      if (stop == PROXY_ABORT && ncclCuMemEnable() && ncclCuMemHostEnable() && !proxyState->directMode && COMPILER_ATOMIC_LOAD(&proxyState->stop, std::memory_order_acquire)) closeConn = 1;
       ncclProxyAsyncOp* op = peer->asyncOps;
       while (op != nullptr) {
         ncclProxyAsyncOp* opnext = op->next; /* in case op is freed in proxyProgressAsync */
         type = op->type;
+        // Coverity gets confused here by complex code structure.  Yes, connectionPool.pools gets dereferenced, and
+        // while calling proxyProgressAsync() connectionPool.pools is NULL, but that changes before it's dereferenced.
+        // coverity[var_deref_model:FALSE]
         res = proxyProgressAsync(op, proxyState, &asyncOpCount, peer, &connectionPool);
         if (res == ncclSuccess || res == ncclInProgress) {
           op = opnext;
@@ -1540,14 +1722,15 @@ void* ncclProxyService(void* _args) {
         int closed;
         res = ncclSocketTryRecv(sock, &type, sizeof(int), &closed, false /*blocking*/);
         if (res != ncclSuccess && res != ncclInProgress) {
-          WARN("[Service thread] Could not receive type from localRank %d, res=%u, closed=%d", peer->tpLocalRank, res, closed);
+          if (!COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_relaxed))
+            WARN("[Service thread] Could not receive type from localRank %d, res=%u, closed=%d", peer->tpLocalRank, res, closed);
           closeConn = 1;
         } else if (closed) {
           INFO(NCCL_INIT|NCCL_NET|NCCL_PROXY, "[Service thread] Connection closed by localRank %d", peer->tpLocalRank);
           closeConn = 1;
         } else if (res == ncclSuccess) { // We received something from the sock
           if (type == ncclProxyMsgStop) {
-            stop = 1;
+            stop = PROXY_STOP;
             closeConn = 1;
           } else if (type == ncclProxyMsgClose) {
             closeConn = 1;
@@ -1564,18 +1747,19 @@ void* ncclProxyService(void* _args) {
         closeConn = 1;
       }
       if (res != ncclSuccess && res != ncclInProgress) {
-        WARN("[Proxy Service %d] Failed to execute operation %s from rank %d, retcode %d", proxyState->tpRank, ncclProxyMsgTypeStr[type], peer->tpRank, res);
+        if (!COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_relaxed))
+          WARN("[Proxy Service %d] Failed to execute operation %s from rank %d, retcode %d", proxyState->tpRank, ncclProxyMsgTypeStr[type], peer->tpRank, res);
         closeConn = 1;
       }
 
       if (closeConn) {
-        ncclSocketClose(sock);
+        (void)ncclSocketClose(sock);
 
         if (op != nullptr) {
           asyncProxyOpDequeue(peer, op);
           asyncOpCount--;
         }
-        pollfds[s].fd = -1;
+        pollfds[s].fd = NCCL_INVALID_SOCKET;
         npeers--;
       }
     }
@@ -1586,10 +1770,10 @@ void* ncclProxyService(void* _args) {
     WARN("[Proxy Service] proxyDestroy failed");
   }
   for (int s=0; s<maxnpeers; s++) {
-    ncclSocketClose(&peers[s].sock);
+    (void)ncclSocketClose(&peers[s].sock);
   }
   ncclProxyFreeConnections(&connectionPool, proxyState);
-  ncclSocketClose(proxyState->listenSock);
+  (void)ncclSocketClose(proxyState->listenSock);
   free(proxyState->listenSock);
   proxyOpsFree(proxyState);
   return NULL;
@@ -1599,12 +1783,23 @@ void* ncclProxyService(void* _args) {
 // Process a request on the UDS socket
 static ncclResult_t proxyUDSRecvReq(struct ncclProxyState* proxyState, int reqFd) {
   ncclIpcHdr hdr;
-  NCCLCHECK(ncclIpcSocketRecvMsg(&proxyState->ipcSock, &hdr, sizeof(hdr), NULL));
+  int rmtFd = -1;
+
+  NCCLCHECK(ncclIpcSocketRecvMsg(&proxyState->ipcSock, &hdr, sizeof(hdr), &rmtFd));
   if (hdr.type == ncclProxyMsgGetFd) {
-    // cuMem API support
+    // cuMem API support for non-UB case, and rmtFd is not used since UDS proxy thread need to export
+    // fd from handle and send it back to the main thread to import the buffer. We just need to close
+    // this dummy rmtFd.
     uint64_t handle = *(uint64_t*)hdr.data;
     INFO(NCCL_PROXY, "proxyUDSRecvReq::ncclProxyMsgGetFd rank %d opId %p handle=0x%lx", hdr.rank, hdr.opId, handle);
+    close(rmtFd);
     return proxyGetFd(proxyState, hdr.rank, hdr.opId, handle);
+  } else if (hdr.type == ncclProxyMsgQueryFd) {
+    // remote main thread registers buffer into this rank, it querys rmtFd of this rank through UDS
+    // and the rmtFd is returned unchanged back to remote main thread which will use rmtFd to call into
+    // proxy service thread for buffer registration.
+    INFO(NCCL_PROXY, "proxyUDSRecvReq::proxyQueryFd rank %d opId %p rmtFd %d", hdr.rank, hdr.opId, rmtFd);
+    return proxyQueryFd(proxyState, hdr.rank, hdr.opId, rmtFd);
   }
 
   return ncclInternalError;
@@ -1615,9 +1810,14 @@ void* ncclProxyServiceUDS(void* _args) {
   struct ncclProxyState* proxyState =  (struct ncclProxyState*) _args;
   struct pollfd pollfds[1];
 
+  // set the thread affinity before setting the cuda context
+  std::call_once(proxyCpusetOnceFlag, proxyCpusetOnceFunc);
+  if (ncclOsCpuCount(proxyCpuset)) ncclOsSetAffinity(proxyCpuset);
+  INFO(NCCL_INIT, "[Proxy Service UDS] Device %d CPU core %d", proxyState->cudaDev, ncclOsGetCpu());
+
   if (setProxyThreadContext(proxyState)) {
-    INFO(NCCL_INIT, "[Proxy Service UDS] Created CUDA context on device %d", proxyState->cudaDev);
-  } else if (cudaSetDevice(proxyState->cudaDev) != cudaSuccess) {
+    INFO(NCCL_INIT, "[Proxy Service UDS] Set CUDA context on device %d", proxyState->cudaDev);
+  } else if (!CUDASUCCESS(cudaSetDevice(proxyState->cudaDev))) {
     WARN("[Proxy Service UDS] Failed to set CUDA device %d", proxyState->cudaDev);
   }
 
@@ -1639,7 +1839,7 @@ void* ncclProxyServiceUDS(void* _args) {
     }
 
     // Check for stop/abort
-    if (proxyState->stop || *proxyState->abortFlag) break;
+    if (COMPILER_ATOMIC_LOAD(&proxyState->stop, std::memory_order_acquire) || COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire)) break;
 
     if (pollfds[0].revents) {
       // A request was seen on the UDS fd
@@ -1647,31 +1847,29 @@ void* ncclProxyServiceUDS(void* _args) {
     }
   }
 
-  ncclIpcSocketClose(&proxyState->ipcSock);
+  (void)ncclIpcSocketClose(&proxyState->ipcSock);
   INFO(NCCL_PROXY, "[Proxy Service UDS] exit: stop %d abortFlag %d", proxyState->stop, *proxyState->abortFlag);
   return NULL;
 }
 
 ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses, uint64_t *peerAddressesUDS) {
-  assert(comm->sharedRes->proxyState == NULL);
-  NCCLCHECK(ncclCalloc(&comm->sharedRes->proxyState, 1));
+  assert(comm->sharedRes->proxyState == nullptr);
+  comm->sharedRes->proxyState = new ncclProxyState{};
   comm->proxyState = comm->sharedRes->proxyState;
   comm->proxyState->refCount = 1;
   comm->proxyState->listenSock = sock;
   comm->proxyState->peerAddresses = peerAddresses;
   comm->proxyState->peerAddressesUDS = peerAddressesUDS;
-  // Seed the random number generator for UDS filename generation
-  struct timeval time;
-  gettimeofday(&time,NULL);
-  unsigned int seed = time.tv_sec*time.tv_usec;
-  seed ^= getpid();
-  srandom(seed);
+  comm->proxyState->netAttr = NCCL_NET_ATTR_INIT;
+
+  // UDS support
+  NCCLCHECK(ncclIpcSocketInit(&comm->proxyState->ipcSock, comm->rank, peerAddressesUDS[comm->rank], comm->abortFlag));
   return ncclSuccess;
 }
 
 ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
   /* proxyState is shared among parent comm and split comms. comm->proxyState->thread is
-   * pthread_join()'d by commFree() in init.cc when the refCount reduces down to 0. */
+   * join()'d by commFree() in init.cc when the refCount reduces down to 0. */
   struct ncclProxyState* proxyState = comm->proxyState;
   if (proxyState->refCount == 1) {
     /* we have to make sure all following fields in comm have been initialized. */
@@ -1687,15 +1885,19 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
     proxyState->dmaBufSupport = comm->dmaBufSupport;
     proxyState->ncclNet = comm->ncclNet;
     proxyState->ncclCollNet = comm->ncclCollNet;
+    proxyState->ginState = &comm->sharedRes->ginState;
+    proxyState->netContext = comm->netContext;
+    proxyState->collNetContext = comm->collNetContext;
+    proxyState->profilerContext = comm->profilerContext;
+    proxyState->directMode = comm->directMode;
     memcpy(proxyState->buffSizes, comm->buffSizes, sizeof(comm->buffSizes));
 
-    pthread_create(&comm->proxyState->thread, NULL, ncclProxyService, comm->proxyState);
+    comm->proxyState->thread = std::thread(ncclProxyService, comm->proxyState);
     ncclSetThreadName(comm->proxyState->thread, "NCCL Service %2d", comm->cudaDev);
 
     // UDS support
-    INFO(NCCL_PROXY, "UDS: Creating service thread comm %p rank %d pidHash %lx", comm, comm->rank, comm->peerInfo[comm->rank].pidHash);
-    NCCLCHECK(ncclIpcSocketInit(&comm->proxyState->ipcSock, comm->rank, comm->peerInfo[comm->rank].pidHash, comm->abortFlag));
-    pthread_create(&comm->proxyState->threadUDS, NULL, ncclProxyServiceUDS, comm->proxyState);
+    INFO(NCCL_PROXY, "UDS: Creating service thread comm %p rank %d", comm, comm->rank);
+    comm->proxyState->threadUDS = std::thread(ncclProxyServiceUDS, comm->proxyState);
     ncclSetThreadName(comm->proxyState->threadUDS, "NCCL UDS Service %2d", comm->cudaDev);
   }
   return ncclSuccess;
@@ -1706,20 +1908,15 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm) {
     struct ncclProxyState* sharedProxyState = comm->proxyState;
 
     if ((comm->proxyRefCountOld = ncclAtomicRefCountDecrement(&sharedProxyState->refCount)) == 0) {
-      if (comm->proxyState->threadUDS) {
-        // UDS support
-        comm->proxyState->stop = 1;
-      }
-
-      if (sharedProxyState->peerAddresses) {
-        if (__atomic_load_n(comm->abortFlag, __ATOMIC_RELAXED) == 0) {
-          struct ncclSocket sock;
-          int type = ncclProxyMsgStop;
-          NCCLCHECK(ncclSocketInit(&sock, sharedProxyState->peerAddresses + comm->topParentRanks[comm->rank], comm->sharedRes->magic, ncclSocketTypeProxy, comm->abortFlag));
-          NCCLCHECK(ncclSocketConnect(&sock));
-          NCCLCHECK(ncclSocketSend(&sock, &type, sizeof(int)));
-          NCCLCHECK(ncclSocketClose(&sock));
+      if (*comm->abortFlag == 0 && sharedProxyState->peerAddresses) {
+        // We need to send a ncclProxyMsgStop message to our own proxy
+        struct ncclSocket sock;
+        int type = ncclProxyMsgStop;
+        NCCLCHECK(ncclSocketInit(&sock, sharedProxyState->peerAddresses + comm->topParentRanks[comm->rank], comm->sharedRes->magic, ncclSocketTypeProxy, comm->abortFlag));
+        if (ncclSocketConnect(&sock) == ncclSuccess) {
+          (void)ncclSocketSend(&sock, &type, sizeof(int));
         }
+        (void)ncclSocketClose(&sock);
       }
 
       if (sharedProxyState->peerSocks) {
@@ -1737,11 +1934,13 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm) {
               }
             }
             int type = ncclProxyMsgClose;
-            if (__atomic_load_n(comm->abortFlag, __ATOMIC_RELAXED) == 0) NCCLCHECK(ncclSocketSend(sharedProxyState->peerSocks + i, &type, sizeof(int)));
+            (void)ncclSocketSend(sharedProxyState->peerSocks + i, &type, sizeof(int));
             NCCLCHECK(ncclSocketClose(sharedProxyState->peerSocks + i));
           }
         }
       }
+      // Now we notify proxy service and UDS thread to exit.
+      COMPILER_ATOMIC_STORE(&comm->proxyState->stop, 1, std::memory_order_release);
     }
   }
 
@@ -1751,13 +1950,15 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm) {
 ncclResult_t ncclProxyDestroy(struct ncclComm* comm) {
   struct ncclProxyState* sharedProxyState = comm->sharedRes->proxyState;
 
-  assert(sharedProxyState->refCount == 0);
-  free(sharedProxyState->peerAddresses);
-  free(sharedProxyState->peerAddressesUDS);
-  free(sharedProxyState->peerSocks);
-  free(sharedProxyState->proxyOps);
-  free(sharedProxyState->sharedDevMems);
-  expectedProxyResponseFree(sharedProxyState);
-  free(sharedProxyState);
+  if (sharedProxyState) {
+    assert(sharedProxyState->refCount == 0);
+    free(sharedProxyState->peerAddresses);
+    free(sharedProxyState->peerAddressesUDS);
+    free(sharedProxyState->peerSocks);
+    free(sharedProxyState->proxyOps);
+    free(sharedProxyState->sharedDevMems);
+    expectedProxyResponseFree(sharedProxyState);
+    delete sharedProxyState;
+  }
   return ncclSuccess;
 }
